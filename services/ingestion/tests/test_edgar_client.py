@@ -1,8 +1,9 @@
 """Unit tests for the EDGAR client, config, Kafka producer, and FastAPI app.
 
 All HTTP calls are mocked — no real network traffic.
-Covers: search, fetch, skip-on-failure (FR-5), Filing dataclass,
-        config loading, Kafka producer serialisation, and FastAPI endpoints.
+Covers: ticker→CIK resolution, submissions listing, document fetch,
+retry/backoff, skip-on-failure (FR-5), Filing dataclass, config loading,
+Kafka producer serialisation, and FastAPI endpoints.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ def _make_async_response(
     json_data: dict[str, Any] | None = None,
     text_data: str | None = None,
     raise_on_status: Exception | None = None,
-) -> MagicMock:
+) -> tuple[MagicMock, Any]:
     """Create a mock that works as an ``async with session.get(...) as resp:`` target."""
 
     mock_resp = MagicMock()
@@ -63,94 +64,201 @@ def _make_async_response(
     return mock_resp, _ctx_manager
 
 
+_TICKER_MAP = {
+    "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+    "1": {"cik_str": 789019, "ticker": "MSFT", "title": "Microsoft Corporation"},
+}
+
+
+def _submissions(entries: list[tuple[str, str, str, str]]) -> dict[str, Any]:
+    """Build a submissions JSON from (form, accession, filing_date, primary_doc) tuples."""
+    return {
+        "name": "Apple Inc.",
+        "filings": {
+            "recent": {
+                "form": [e[0] for e in entries],
+                "accessionNumber": [e[1] for e in entries],
+                "filingDate": [e[2] for e in entries],
+                "primaryDocument": [e[3] for e in entries],
+            }
+        },
+    }
+
+
 @pytest.fixture
 def client() -> EdgarClient:
     return EdgarClient(user_agent="TestAgent test@example.com", rate_limit_rps=100, max_retries=1)
 
 
-# ── EdgarClient.search_10k_filings ──────────────────────────────
+# ── EdgarClient.resolve_cik ──────────────────────────────────────
 
 
-class TestSearchFilings:
-    """Tests for EdgarClient.search_10k_filings."""
+class TestResolveCik:
+    """Tests for ticker → CIK resolution via company_tickers.json."""
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_http_error(self, client: EdgarClient) -> None:
-        """If EDGAR returns an HTTP error, search returns [] (FR-5)."""
+    async def test_resolves_known_ticker(self, client: EdgarClient) -> None:
+        _, ctx = _make_async_response(json_data=_TICKER_MAP)
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        resolved = await client.resolve_cik("AAPL", mock_session)
+        assert resolved == (320193, "Apple Inc.")
+
+    @pytest.mark.asyncio
+    async def test_resolution_is_case_insensitive(self, client: EdgarClient) -> None:
+        _, ctx = _make_async_response(json_data=_TICKER_MAP)
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        resolved = await client.resolve_cik("aapl", mock_session)
+        assert resolved == (320193, "Apple Inc.")
+
+    @pytest.mark.asyncio
+    async def test_unknown_ticker_returns_none(self, client: EdgarClient) -> None:
+        _, ctx = _make_async_response(json_data=_TICKER_MAP)
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        assert await client.resolve_cik("ZZZZ", mock_session) is None
+
+    @pytest.mark.asyncio
+    async def test_mapping_is_cached_after_first_call(self, client: EdgarClient) -> None:
+        call_count = 0
+
+        @asynccontextmanager
+        async def _counting_ctx(*a: Any, **kw: Any) -> AsyncGenerator[MagicMock, None]:
+            nonlocal call_count
+            call_count += 1
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status = MagicMock()
+
+            async def _json(**kwargs: Any) -> dict[str, Any]:
+                return _TICKER_MAP
+
+            mock_resp.json = _json
+            yield mock_resp
+
+        mock_session = MagicMock()
+        mock_session.get = _counting_ctx
+
+        await client.resolve_cik("AAPL", mock_session)
+        await client.resolve_cik("MSFT", mock_session)
+        assert call_count == 1  # second lookup served from cache
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_returns_none(self, client: EdgarClient) -> None:
         import aiohttp
 
         _, ctx = _make_async_response(raise_on_status=aiohttp.ClientResponseError(
             request_info=MagicMock(), history=(), status=500, message="Server Error"
         ))
-
         mock_session = MagicMock()
         mock_session.get = ctx
 
-        result = await client.search_10k_filings("AAPL", mock_session)
-        assert result == []
+        assert await client.resolve_cik("AAPL", mock_session) is None
+
+
+# ── EdgarClient.list_10k_filings ─────────────────────────────────
+
+
+class TestList10kFilings:
+    """Tests for filing listing via the submissions API."""
 
     @pytest.mark.asyncio
-    async def test_parses_hits_correctly(self, client: EdgarClient) -> None:
-        """Verify that search extracts the hits array from EDGAR JSON."""
-        edgar_response = {
-            "hits": {
-                "hits": [
-                    {"_source": {"accession_no": "0001-24-000001", "file_date": "2024-11-01"}},
-                    {"_source": {"accession_no": "0001-24-000002", "file_date": "2024-11-02"}},
-                ]
-            }
-        }
-
-        _, ctx = _make_async_response(json_data=edgar_response)
+    async def test_returns_only_10k_forms(self, client: EdgarClient) -> None:
+        data = _submissions([
+            ("10-K", "0001-24-000001", "2024-11-01", "aapl-2024.htm"),
+            ("10-Q", "0001-24-000002", "2024-08-01", "aapl-q3.htm"),
+            ("8-K", "0001-24-000003", "2024-07-01", "aapl-8k.htm"),
+            ("10-K/A", "0001-24-000004", "2024-12-01", "aapl-2024a.htm"),
+        ])
+        _, ctx = _make_async_response(json_data=data)
         mock_session = MagicMock()
         mock_session.get = ctx
 
-        result = await client.search_10k_filings("AAPL", mock_session)
-        assert len(result) == 2
-        assert result[0]["_source"]["accession_no"] == "0001-24-000001"
+        filings = await client.list_10k_filings(320193, mock_session)
+        assert len(filings) == 1
+        assert filings[0]["accession_number"] == "0001-24-000001"
+        assert filings[0]["primary_document"] == "aapl-2024.htm"
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_unexpected_exception(self, client: EdgarClient) -> None:
-        """Non-aiohttp exceptions are caught and return []."""
-
-        @asynccontextmanager
-        async def _raise_ctx(*a: Any, **kw: Any) -> AsyncGenerator[None, None]:
-            raise ValueError("unexpected")
-            yield  # noqa: RET504  # type: ignore[misc]
-
+    async def test_respects_filings_since_cutoff(self, client: EdgarClient) -> None:
+        data = _submissions([
+            ("10-K", "0001-24-000001", "2024-11-01", "new.htm"),
+            ("10-K", "0001-19-000001", "2019-10-30", "old.htm"),
+        ])
+        _, ctx = _make_async_response(json_data=data)
         mock_session = MagicMock()
-        mock_session.get = _raise_ctx
+        mock_session.get = ctx
 
-        result = await client.search_10k_filings("AAPL", mock_session)
-        assert result == []
+        filings = await client.list_10k_filings(320193, mock_session)
+        assert [f["accession_number"] for f in filings] == ["0001-24-000001"]
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_missing_hits(self, client: EdgarClient) -> None:
-        """If response has no 'hits' key, return empty list."""
+    async def test_caps_at_max_filings_per_ticker(self) -> None:
+        client = EdgarClient(
+            user_agent="Test", rate_limit_rps=100, max_retries=1, max_filings_per_ticker=2
+        )
+        data = _submissions([
+            ("10-K", f"0001-2{i}-000001", f"202{4 - i}-11-01", f"doc{i}.htm")
+            for i in range(4)
+        ])
+        _, ctx = _make_async_response(json_data=data)
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        filings = await client.list_10k_filings(320193, mock_session)
+        assert len(filings) == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_entries_missing_primary_document(self, client: EdgarClient) -> None:
+        data = _submissions([
+            ("10-K", "0001-24-000001", "2024-11-01", ""),
+            ("10-K", "0001-23-000001", "2023-11-01", "aapl-2023.htm"),
+        ])
+        _, ctx = _make_async_response(json_data=data)
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        filings = await client.list_10k_filings(320193, mock_session)
+        assert [f["accession_number"] for f in filings] == ["0001-23-000001"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_returns_empty(self, client: EdgarClient) -> None:
+        import aiohttp
+
+        _, ctx = _make_async_response(raise_on_status=aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=503, message="Unavailable"
+        ))
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        assert await client.list_10k_filings(320193, mock_session) == []
+
+    @pytest.mark.asyncio
+    async def test_empty_submissions_returns_empty(self, client: EdgarClient) -> None:
         _, ctx = _make_async_response(json_data={})
         mock_session = MagicMock()
         mock_session.get = ctx
 
-        result = await client.search_10k_filings("AAPL", mock_session)
-        assert result == []
+        assert await client.list_10k_filings(320193, mock_session) == []
 
 
-# ── EdgarClient retry / backoff (search) ─────────────────────────
+# ── EdgarClient retry / backoff (JSON fetches) ───────────────────
 
 
-class TestSearchFilingsRetry:
-    """Verify exponential backoff in search_10k_filings (max_retries=3)."""
+class TestGetJsonRetry:
+    """Verify exponential backoff in _get_json (max_retries=3)."""
 
     @pytest.mark.asyncio
     async def test_retries_on_client_error_then_succeeds(self) -> None:
-        """Fails twice, succeeds on the third attempt; sleep called twice."""
         import aiohttp
 
         client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
         error = aiohttp.ClientResponseError(
             request_info=MagicMock(), history=(), status=503, message="Unavailable"
         )
-        edgar_response = {"hits": {"hits": [{"_source": {"adsh": "0001", "file_date": "2024"}}]}}
 
         call_count = 0
 
@@ -165,7 +273,7 @@ class TestSearchFilingsRetry:
                 mock_resp.raise_for_status = MagicMock()
 
                 async def _json(**kwargs: Any) -> dict[str, Any]:
-                    return edgar_response
+                    return _TICKER_MAP
 
                 mock_resp.json = _json
             yield mock_resp
@@ -174,18 +282,16 @@ class TestSearchFilingsRetry:
         mock_session.get = _flaky_ctx
 
         with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
-            result = await client.search_10k_filings("AAPL", mock_session)
+            resolved = await client.resolve_cik("AAPL", mock_session)
 
-        assert len(result) == 1
+        assert resolved == (320193, "Apple Inc.")
         assert call_count == 3
         # Two backoff sleeps (2 s, 4 s) plus one sub-second rate-limit sleep on success.
-        # Filter on >= 1 s to isolate the exponential-backoff sleeps.
         backoff_args = [c.args[0] for c in mock_sleep.call_args_list if c.args[0] >= 1]
         assert backoff_args == [2, 4]
 
     @pytest.mark.asyncio
-    async def test_returns_empty_after_all_retries_exhausted(self) -> None:
-        """All attempts fail — returns [] without raising; sleep called max_retries-1 times."""
+    async def test_returns_failure_value_after_all_retries_exhausted(self) -> None:
         import aiohttp
 
         client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
@@ -203,48 +309,75 @@ class TestSearchFilingsRetry:
         mock_session.get = _always_fail
 
         with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
-            result = await client.search_10k_filings("AAPL", mock_session)
+            resolved = await client.resolve_cik("AAPL", mock_session)
 
-        assert result == []
+        assert resolved is None
         # 3 attempts → 2 sleeps (no sleep after the final failure)
-        assert mock_sleep.call_count == 2
-        sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
-        assert sleep_args == [2, 4]
-
-    @pytest.mark.asyncio
-    async def test_backoff_values_follow_exponential_schedule(self) -> None:
-        """Verify exact sleep durations: 2^1, 2^2 seconds for max_retries=3."""
-        import aiohttp
-
-        client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
-        error = aiohttp.ClientResponseError(
-            request_info=MagicMock(), history=(), status=500, message="Error"
-        )
-
-        @asynccontextmanager
-        async def _fail(*a: Any, **kw: Any):  # type: ignore[misc]
-            mock_resp = MagicMock()
-            mock_resp.raise_for_status.side_effect = error
-            yield mock_resp
-
-        mock_session = MagicMock()
-        mock_session.get = _fail
-
-        with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
-            await client.search_10k_filings("AAPL", mock_session)
-
         assert mock_sleep.call_args_list == [call(2), call(4)]
 
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_fails_immediately(self) -> None:
+        client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
 
-# ── EdgarClient retry / backoff (fetch) ──────────────────────────
+        @asynccontextmanager
+        async def _raise_ctx(*a: Any, **kw: Any) -> AsyncGenerator[None, None]:
+            raise ValueError("unexpected")
+            yield  # noqa: RET504  # type: ignore[misc]
+
+        mock_session = MagicMock()
+        mock_session.get = _raise_ctx
+
+        with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
+            resolved = await client.resolve_cik("AAPL", mock_session)
+
+        assert resolved is None
+        mock_sleep.assert_not_called()
 
 
-class TestFetchFilingTextRetry:
-    """Verify exponential backoff in fetch_filing_text (max_retries=3)."""
+# ── EdgarClient.fetch_filing_document ────────────────────────────
+
+
+class TestFetchFilingDocument:
+    """Tests for EdgarClient.fetch_filing_document."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_error(self, client: EdgarClient) -> None:
+        """If fetch fails, return None instead of raising (FR-5)."""
+        import aiohttp
+
+        _, ctx = _make_async_response(raise_on_status=aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=404, message="Not Found"
+        ))
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        result = await client.fetch_filing_document("https://example.com/filing", mock_session)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_text_on_success(self, client: EdgarClient) -> None:
+        _, ctx = _make_async_response(text_data="Item 1. Business...")
+        mock_session = MagicMock()
+        mock_session.get = ctx
+
+        result = await client.fetch_filing_document("https://example.com/filing", mock_session)
+        assert result == "Item 1. Business..."
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_unexpected_exception(self, client: EdgarClient) -> None:
+        @asynccontextmanager
+        async def _raise_ctx(*a: Any, **kw: Any) -> AsyncGenerator[None, None]:
+            raise RuntimeError("boom")
+            yield  # noqa: RET504  # type: ignore[misc]
+
+        mock_session = MagicMock()
+        mock_session.get = _raise_ctx
+
+        result = await client.fetch_filing_document("https://example.com/f", mock_session)
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_retries_on_client_error_then_succeeds(self) -> None:
-        """Fails twice, succeeds on the third attempt; sleep called twice."""
         import aiohttp
 
         client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
@@ -278,51 +411,29 @@ class TestFetchFilingTextRetry:
         mock_session.get = _flaky_ctx
 
         with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
-            result = await client.fetch_filing_text("https://example.com/f", mock_session)
+            result = await client.fetch_filing_document("https://example.com/f", mock_session)
 
         assert result == "Item 1. Business..."
         assert call_count == 3
-        # Two backoff sleeps (2 s, 4 s) plus one sub-second rate-limit sleep on success.
         backoff_args = [c.args[0] for c in mock_sleep.call_args_list if c.args[0] >= 1]
         assert backoff_args == [2, 4]
 
+
+# ── EdgarClient.fetch_company_facts ──────────────────────────────
+
+
+class TestFetchCompanyFacts:
     @pytest.mark.asyncio
-    async def test_returns_none_after_all_retries_exhausted(self) -> None:
-        """All attempts fail — returns None; sleep called max_retries-1 times."""
-        import aiohttp
-
-        client = EdgarClient(user_agent="Test", rate_limit_rps=100, max_retries=3)
-        error = aiohttp.ClientResponseError(
-            request_info=MagicMock(), history=(), status=503, message="Unavailable"
-        )
-
-        @asynccontextmanager
-        async def _always_fail(*a: Any, **kw: Any):  # type: ignore[misc]
-            mock_resp = MagicMock()
-            mock_resp.raise_for_status.side_effect = error
-            yield mock_resp
-
+    async def test_returns_parsed_json(self, client: EdgarClient) -> None:
+        doc = {"cik": 320193, "facts": {"us-gaap": {}}}
+        _, ctx = _make_async_response(json_data=doc)
         mock_session = MagicMock()
-        mock_session.get = _always_fail
+        mock_session.get = ctx
 
-        with patch("src.edgar_client.asyncio.sleep") as mock_sleep:
-            result = await client.fetch_filing_text("https://example.com/f", mock_session)
-
-        assert result is None
-        assert mock_sleep.call_count == 2
-        sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
-        assert sleep_args == [2, 4]
-
-
-# ── EdgarClient.fetch_filing_text ────────────────────────────────
-
-
-class TestFetchFilingText:
-    """Tests for EdgarClient.fetch_filing_text."""
+        assert await client.fetch_company_facts(320193, mock_session) == doc
 
     @pytest.mark.asyncio
     async def test_returns_none_on_error(self, client: EdgarClient) -> None:
-        """If fetch fails, return None instead of raising (FR-5)."""
         import aiohttp
 
         _, ctx = _make_async_response(raise_on_status=aiohttp.ClientResponseError(
@@ -331,130 +442,101 @@ class TestFetchFilingText:
         mock_session = MagicMock()
         mock_session.get = ctx
 
-        result = await client.fetch_filing_text("https://example.com/filing", mock_session)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_returns_text_on_success(self, client: EdgarClient) -> None:
-        """On success, return the response body as a string."""
-        _, ctx = _make_async_response(text_data="Item 1. Business...")
-        mock_session = MagicMock()
-        mock_session.get = ctx
-
-        result = await client.fetch_filing_text("https://example.com/filing", mock_session)
-        assert result == "Item 1. Business..."
-
-    @pytest.mark.asyncio
-    async def test_returns_none_on_unexpected_exception(self, client: EdgarClient) -> None:
-        """Non-aiohttp exceptions are caught and return None."""
-
-        @asynccontextmanager
-        async def _raise_ctx(*a: Any, **kw: Any) -> AsyncGenerator[None, None]:
-            raise RuntimeError("boom")
-            yield  # noqa: RET504  # type: ignore[misc]
-
-        mock_session = MagicMock()
-        mock_session.get = _raise_ctx
-
-        result = await client.fetch_filing_text("https://example.com/f", mock_session)
-        assert result is None
+        assert await client.fetch_company_facts(320193, mock_session) is None
 
 
 # ── EdgarClient.get_filings_for_ticker ───────────────────────────
 
 
 class TestGetFilingsForTicker:
-    """Tests for the end-to-end per-ticker method.
-
-    NOTE: The real edgar_client.py uses the EDGAR field names:
-      - 'adsh' for accession number
-      - 'ciks' (list) for CIK
-    The search_10k_filings mock must return dicts matching this schema.
-    """
+    """Tests for the end-to-end per-ticker method."""
 
     @pytest.mark.asyncio
-    async def test_skips_hits_without_accession(self, client: EdgarClient) -> None:
-        """Hits missing 'adsh' should be skipped (FR-5)."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {"file_date": "2024-01-01", "ciks": ["1234567890"]}},
-        ]):
-            result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
+    async def test_returns_empty_when_ticker_unknown(self, client: EdgarClient) -> None:
+        with patch.object(client, "resolve_cik", return_value=None):
+            result = await client.get_filings_for_ticker("ZZZZ", "Unknown", MagicMock())
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_skips_hits_without_cik(self, client: EdgarClient) -> None:
-        """Hits with 'adsh' but missing/empty 'ciks' should be skipped."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {"adsh": "0001-24-000001", "file_date": "2024-01-01", "ciks": []}},
-        ]):
+    async def test_returns_empty_when_no_filings(self, client: EdgarClient) -> None:
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[]):
             result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
         assert result == []
 
     @pytest.mark.asyncio
     async def test_skips_when_fetch_returns_none(self, client: EdgarClient) -> None:
-        """If fetch_filing_text returns None, the filing is skipped."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {"adsh": "0001-24-000001", "file_date": "2024-01-01", "ciks": ["1234567890"]}},
-        ]), patch.object(client, "fetch_filing_text", return_value=None):
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[
+                 {"accession_number": "0001-24-000001", "filing_date": "2024-11-01",
+                  "primary_document": "aapl-2024.htm"},
+             ]), \
+             patch.object(client, "fetch_filing_document", return_value=None):
             result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_returns_filing_on_success(self, client: EdgarClient) -> None:
-        """Happy path: a hit with adsh + ciks produces a Filing."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {
-                "adsh": "0001-24-000001",
-                "file_date": "2024-11-01",
-                "ciks": ["1234567890"],
-            }},
-        ]), patch.object(client, "fetch_filing_text", return_value="Item 1. Business..."):
+    async def test_skips_when_document_parses_to_empty(self, client: EdgarClient) -> None:
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[
+                 {"accession_number": "0001-24-000001", "filing_date": "2024-11-01",
+                  "primary_document": "aapl-2024.htm"},
+             ]), \
+             patch.object(client, "fetch_filing_document",
+                          return_value="<html><body><script>x</script></body></html>"):
             result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
-        assert len(result) == 1
-        assert result[0].ticker == "AAPL"
-        assert result[0].accession_number == "0001-24-000001"
-        assert result[0].raw_text == "Item 1. Business..."
-        assert result[0].company_name == "Apple Inc."
-        assert result[0].filing_type == "10-K"
-        assert "sec.gov" in result[0].source_url
+        assert result == []
 
     @pytest.mark.asyncio
-    async def test_constructs_correct_url(self, client: EdgarClient) -> None:
-        """Verify the SEC archive URL is constructed correctly from adsh + CIK."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {
-                "adsh": "0001-24-000001",
-                "file_date": "2024-11-01",
-                "ciks": ["1234567890"],
-            }},
-        ]), patch.object(client, "fetch_filing_text", return_value="text") as mock_fetch:
+    async def test_returns_parsed_filing_on_success(self, client: EdgarClient) -> None:
+        """Happy path: HTML document is fetched and converted to clean text."""
+        html = "<html><body><div>Item 1. Business</div><p>We sell devices.</p></body></html>"
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[
+                 {"accession_number": "0001-24-000001", "filing_date": "2024-11-01",
+                  "primary_document": "aapl-2024.htm"},
+             ]), \
+             patch.object(client, "fetch_filing_document", return_value=html):
+            result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
+
+        assert len(result) == 1
+        filing = result[0]
+        assert filing.ticker == "AAPL"
+        assert filing.accession_number == "0001-24-000001"
+        assert filing.company_name == "Apple Inc."
+        assert filing.filing_type == "10-K"
+        assert "Item 1. Business" in filing.raw_text
+        assert "We sell devices." in filing.raw_text
+        assert "<" not in filing.raw_text  # no HTML survives
+
+    @pytest.mark.asyncio
+    async def test_constructs_primary_document_url(self, client: EdgarClient) -> None:
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[
+                 {"accession_number": "0001-24-000001", "filing_date": "2024-11-01",
+                  "primary_document": "aapl-2024.htm"},
+             ]), \
+             patch.object(client, "fetch_filing_document", return_value="Item 1. text") as mock_fetch:
             await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
 
-        # Verify the URL passed to fetch_filing_text
-        call_args = mock_fetch.call_args
-        url = call_args[0][0]
-        assert "1234567890" in url
-        assert "000124000001" in url  # dashes removed from accession
-        assert url.endswith("0001-24-000001.txt")
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_when_search_returns_empty(self, client: EdgarClient) -> None:
-        """If search returns no hits, get_filings_for_ticker returns []."""
-        with patch.object(client, "search_10k_filings", return_value=[]):
-            result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
-        assert result == []
+        url = mock_fetch.call_args[0][0]
+        assert url == (
+            "https://www.sec.gov/Archives/edgar/data/320193"
+            "/000124000001/aapl-2024.htm"
+        )
 
     @pytest.mark.asyncio
     async def test_multiple_filings(self, client: EdgarClient) -> None:
-        """Multiple hits with valid data produce multiple Filings."""
-        with patch.object(client, "search_10k_filings", return_value=[
-            {"_source": {"adsh": "0001-24-000001", "file_date": "2024-11-01", "ciks": ["123"]}},
-            {"_source": {"adsh": "0001-24-000002", "file_date": "2024-11-02", "ciks": ["123"]}},
-        ]), patch.object(client, "fetch_filing_text", return_value="filing text"):
+        with patch.object(client, "resolve_cik", return_value=(320193, "Apple Inc.")), \
+             patch.object(client, "list_10k_filings", return_value=[
+                 {"accession_number": "0001-24-000001", "filing_date": "2024-11-01",
+                  "primary_document": "a.htm"},
+                 {"accession_number": "0001-23-000001", "filing_date": "2023-11-03",
+                  "primary_document": "b.htm"},
+             ]), \
+             patch.object(client, "fetch_filing_document", return_value="Item 1. text"):
             result = await client.get_filings_for_ticker("AAPL", "Apple Inc.", MagicMock())
-        assert len(result) == 2
-        assert result[0].accession_number == "0001-24-000001"
-        assert result[1].accession_number == "0001-24-000002"
+        assert [f.accession_number for f in result] == ["0001-24-000001", "0001-23-000001"]
 
 
 # ── Filing dataclass ─────────────────────────────────────────────
@@ -607,6 +689,15 @@ class TestKafkaProducer:
 # ── FastAPI App (main.py) ────────────────────────────────────────
 
 
+def _make_edgar_mock(*, filings: list[Filing] | None = None) -> MagicMock:
+    """Edgar client mock whose facts flow no-ops (resolve_cik → None)."""
+    mock_edgar = MagicMock()
+    mock_edgar.get_filings_for_ticker = AsyncMock(return_value=filings or [])
+    mock_edgar.resolve_cik = AsyncMock(return_value=None)
+    mock_edgar.fetch_company_facts = AsyncMock(return_value=None)
+    return mock_edgar
+
+
 class TestFastAPIApp:
     """Tests for the FastAPI endpoints in main.py.
 
@@ -724,7 +815,7 @@ class TestFastAPIApp:
         original_edgar = main_module._edgar_client
         original_kafka = main_module._kafka_producer
         original_db = main_module._db
-        main_module._edgar_client = MagicMock()
+        main_module._edgar_client = _make_edgar_mock()
         main_module._kafka_producer = MagicMock()
         main_module._db = MagicMock()
 
@@ -744,10 +835,6 @@ class TestFastAPIApp:
 
         import src.main as main_module
 
-        mock_edgar = MagicMock()
-        mock_kafka = MagicMock()
-        mock_db = MagicMock()
-
         filing = Filing(
             accession_number="0001-24-000001",
             ticker="AAPL",
@@ -758,7 +845,10 @@ class TestFastAPIApp:
             raw_text="Item 1...",
         )
 
-        mock_edgar.get_filings_for_ticker = AsyncMock(return_value=[filing])
+        mock_edgar = _make_edgar_mock(filings=[filing])
+        mock_kafka = MagicMock()
+        mock_db = MagicMock()
+
         mock_kafka.publish_filing = MagicMock()
         mock_kafka.flush = MagicMock()
         mock_db.is_already_ingested.return_value = False
@@ -779,9 +869,70 @@ class TestFastAPIApp:
             assert data["tickers_processed"] == ["AAPL"]
             assert data["filings_published"] == 1
             assert data["filings_skipped"] == 0
+            assert data["facts_stored"] == 0
             assert data["errors"] == []
             mock_kafka.publish_filing.assert_called_once_with(filing)
             mock_db.record_ingestion.assert_called_once_with(filing)
+        finally:
+            main_module._edgar_client = original_edgar
+            main_module._kafka_producer = original_kafka
+            main_module._db = original_db
+
+    def test_ingest_stores_company_facts(self) -> None:
+        """POST /v1/ingest fetches XBRL companyfacts and stores annual facts."""
+        from fastapi.testclient import TestClient
+
+        import src.main as main_module
+
+        company_facts = {
+            "facts": {
+                "us-gaap": {
+                    "NetIncomeLoss": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2023-10-01",
+                                    "end": "2024-09-28",
+                                    "val": 93_736_000_000,
+                                    "form": "10-K",
+                                    "fp": "FY",
+                                    "fy": 2024,
+                                    "filed": "2024-11-01",
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+
+        mock_edgar = MagicMock()
+        mock_edgar.get_filings_for_ticker = AsyncMock(return_value=[])
+        mock_edgar.resolve_cik = AsyncMock(return_value=(320193, "Apple Inc."))
+        mock_edgar.fetch_company_facts = AsyncMock(return_value=company_facts)
+
+        mock_kafka = MagicMock()
+        mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
+        mock_db.store_financial_facts.return_value = 1
+
+        original_edgar = main_module._edgar_client
+        original_kafka = main_module._kafka_producer
+        original_db = main_module._db
+        main_module._edgar_client = mock_edgar
+        main_module._kafka_producer = mock_kafka
+        main_module._db = mock_db
+
+        try:
+            client = TestClient(app=main_module.app, raise_server_exceptions=False)
+            response = client.post("/v1/ingest", json={"tickers": ["AAPL"]})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["facts_stored"] == 1
+            stored_facts = mock_db.store_financial_facts.call_args[0][0]
+            assert len(stored_facts) == 1
+            assert stored_facts[0].concept == "NetIncomeLoss"
+            assert stored_facts[0].ticker == "AAPL"
         finally:
             main_module._edgar_client = original_edgar
             main_module._kafka_producer = original_kafka
@@ -793,12 +944,11 @@ class TestFastAPIApp:
 
         import src.main as main_module
 
-        mock_edgar = MagicMock()
-        mock_kafka = MagicMock()
-        mock_db = MagicMock()
-
+        mock_edgar = _make_edgar_mock()
         mock_edgar.get_filings_for_ticker = AsyncMock(side_effect=RuntimeError("EDGAR down"))
+        mock_kafka = MagicMock()
         mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
 
         original_edgar = main_module._edgar_client
         original_kafka = main_module._kafka_producer
@@ -827,11 +977,10 @@ class TestFastAPIApp:
 
         import src.main as main_module
 
-        mock_edgar = MagicMock()
+        mock_edgar = _make_edgar_mock()
         mock_kafka = MagicMock()
-        mock_db = MagicMock()
-        mock_edgar.get_filings_for_ticker = AsyncMock(return_value=[])
         mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
 
         original_edgar = main_module._edgar_client
         original_kafka = main_module._kafka_producer
@@ -860,10 +1009,6 @@ class TestFastAPIApp:
 
         import src.main as main_module
 
-        mock_edgar = MagicMock()
-        mock_kafka = MagicMock()
-        mock_db = MagicMock()
-
         filing = Filing(
             accession_number="0001-24-000001",
             ticker="AAPL",
@@ -874,8 +1019,10 @@ class TestFastAPIApp:
             raw_text="Item 1...",
         )
 
-        mock_edgar.get_filings_for_ticker = AsyncMock(return_value=[filing])
+        mock_edgar = _make_edgar_mock(filings=[filing])
+        mock_kafka = MagicMock()
         mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
         # Simulate filing already present in ingestion_log
         mock_db.is_already_ingested.return_value = True
 
@@ -907,10 +1054,6 @@ class TestFastAPIApp:
 
         import src.main as main_module
 
-        mock_edgar = MagicMock()
-        mock_kafka = MagicMock()
-        mock_db = MagicMock()
-
         new_filing = Filing(
             accession_number="0001-24-000001",
             ticker="AAPL",
@@ -930,8 +1073,10 @@ class TestFastAPIApp:
             raw_text="Item 1 old...",
         )
 
-        mock_edgar.get_filings_for_ticker = AsyncMock(return_value=[new_filing, dup_filing])
+        mock_edgar = _make_edgar_mock(filings=[new_filing, dup_filing])
+        mock_kafka = MagicMock()
         mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
         # new_filing is new, dup_filing is already ingested
         mock_db.is_already_ingested.side_effect = lambda acc: acc == dup_filing.accession_number
 

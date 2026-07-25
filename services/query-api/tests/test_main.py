@@ -330,10 +330,17 @@ class TestQueryEndpoint:
         captured: dict = {}
 
         async def fake_answer(
-            question: str, top_k: int = 5, ticker_filter: str | None = None
+            question: str,
+            top_k: int = 5,
+            ticker_filter: str | None = None,
+            filing_date_from: str | None = None,
+            filing_date_to: str | None = None,
+            include_source_text: bool = False,
         ) -> QueryResponse:
             captured["top_k"] = top_k
             captured["ticker_filter"] = ticker_filter
+            captured["filing_date_from"] = filing_date_from
+            captured["include_source_text"] = include_source_text
             return _make_query_response()
 
         mock_generator = MagicMock()

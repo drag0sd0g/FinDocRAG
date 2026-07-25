@@ -43,6 +43,7 @@ from src.models import (
     QueryRequest,
     QueryResponse,
 )
+from src.rag.facts import FactsRepository
 from src.rag.generator import RAGGenerator
 from src.rag.retriever import Retriever
 
@@ -120,12 +121,13 @@ limiter = Limiter(key_func=_get_api_key)
 
 _retriever: Retriever | None = None
 _generator: RAGGenerator | None = None
+_facts_repo: FactsRepository | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup / shutdown lifecycle."""
-    global _retriever, _generator  # noqa: PLW0603
+    global _retriever, _generator, _facts_repo  # noqa: PLW0603
 
     logger.info("query_api_starting", llm_backend=LLM_BACKEND)
 
@@ -133,6 +135,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _retriever = Retriever(dsn=POSTGRES_DSN, model_name=EMBEDDING_MODEL)
     _retriever.connect()
     _retriever.verify_embedding_model_consistency()
+
+    # Structured XBRL facts (injected into numeric financial questions)
+    _facts_repo = FactsRepository(dsn=POSTGRES_DSN)
+    _facts_repo.connect()
 
     # LLM backend (FR-18) — select via LLM_BACKEND env var
     if LLM_BACKEND == "openai":
@@ -142,7 +148,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         llm = OllamaBackend(base_url=OLLAMA_URL, model=OLLAMA_MODEL)  # type: ignore[assignment]
 
-    _generator = RAGGenerator(retriever=_retriever, llm=llm)
+    _generator = RAGGenerator(retriever=_retriever, llm=llm, facts=_facts_repo)
 
     logger.info("query_api_started")
 
@@ -150,6 +156,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     if _retriever is not None:
         _retriever.close()
+    if _facts_repo is not None:
+        _facts_repo.close()
     logger.info("query_api_stopped")
 
 
@@ -247,6 +255,9 @@ async def query(
         question=body.question,
         top_k=body.top_k,
         ticker_filter=body.ticker_filter,
+        filing_date_from=body.filing_date_from,
+        filing_date_to=body.filing_date_to,
+        include_source_text=body.include_source_text,
     )
 
     # Record Prometheus metrics (TDD Section 8.1.3)

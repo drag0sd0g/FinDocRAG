@@ -45,6 +45,11 @@ class OllamaBackend:
             "model": self._model,
             "prompt": prompt,
             "stream": False,
+            # Suppress chain-of-thought on reasoning models (e.g. Qwen3): we want
+            # the grounded answer in `response`, not thinking tokens that would
+            # otherwise consume the num_predict budget and leave `response` empty.
+            # Ignored by non-reasoning models (e.g. mistral).
+            "think": False,
             "options": {
                 "num_predict": max_tokens,
             },

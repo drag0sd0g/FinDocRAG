@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from src.config import load_tickers, settings
 from src.db import IngestionDB
 from src.edgar_client import EdgarClient
+from src.facts import extract_annual_facts
 from src.kafka_producer import FilingProducer
 from src.metrics import FILINGS_FETCHED_TOTAL
 
@@ -89,6 +90,7 @@ class IngestResponse(BaseModel):
     tickers_processed: list[str]
     filings_published: int
     filings_skipped: int
+    facts_stored: int
     errors: list[str]
 
 
@@ -219,6 +221,30 @@ def _publish_single_filing(
     return "published"
 
 
+async def _ingest_company_facts(
+    edgar_client: EdgarClient,
+    db: IngestionDB,
+    symbol: str,
+    session: aiohttp.ClientSession,
+) -> int:
+    """Fetch XBRL companyfacts for a ticker and upsert the tracked annual facts.
+
+    Returns the number of facts stored (0 on any failure — facts are a
+    best-effort enrichment and must not fail the filing ingestion).
+    """
+    resolved = await edgar_client.resolve_cik(symbol, session)
+    if resolved is None:
+        return 0
+    cik, _ = resolved
+
+    company_facts = await edgar_client.fetch_company_facts(cik, session)
+    if company_facts is None:
+        return 0
+
+    facts = extract_annual_facts(company_facts, ticker=symbol, cik=cik)
+    return db.store_financial_facts(facts)
+
+
 # ── Ingestion endpoint (TDD Section 5.2.1) ──────────────────────
 
 @app.post("/v1/ingest", response_model=IngestResponse)
@@ -237,6 +263,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
 
     filings_published = 0
     filings_skipped = 0
+    facts_stored = 0
     errors: list[str] = []
     tickers_processed: list[str] = []
 
@@ -266,6 +293,11 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
                         filings_skipped += 1
                         FILINGS_FETCHED_TOTAL.labels(ticker=symbol, status="skipped").inc()
 
+                # Structured XBRL facts (best-effort — never fails the ticker)
+                facts_stored += await _ingest_company_facts(
+                    _edgar_client, _db, symbol, session
+                )
+
                 tickers_processed.append(symbol)
                 logger.info(
                     "ingest_ticker_complete",
@@ -293,6 +325,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
         tickers=tickers_processed,
         filings_published=filings_published,
         filings_skipped=filings_skipped,
+        facts_stored=facts_stored,
         errors=len(errors),
         elapsed_ms=round((time.perf_counter() - t_request) * 1000, 1),
     )
@@ -302,6 +335,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
         tickers_processed=tickers_processed,
         filings_published=filings_published,
         filings_skipped=filings_skipped,
+        facts_stored=facts_stored,
         errors=errors,
     )
 

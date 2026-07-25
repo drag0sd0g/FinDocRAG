@@ -102,7 +102,13 @@ async def _call_query_api(
     top_k: int,
 ) -> dict[str, Any]:
     """POST /v1/query and return the parsed response body."""
-    payload: dict[str, Any] = {"question": question, "top_k": top_k}
+    payload: dict[str, Any] = {
+        "question": question,
+        "top_k": top_k,
+        # Full chunk text per source — ragas must score against the real
+        # retrieved context, not the 200-char preview.
+        "include_source_text": True,
+    }
     if ticker:
         payload["ticker_filter"] = ticker
 
@@ -150,16 +156,18 @@ async def collect_responses(
                 resp = await _call_query_api(
                     session, question, ticker, api_url, api_key, top_k
                 )
-                # text_preview (200 chars) is what the API exposes per FR-17;
-                # it is sufficient for ragas context scoring.
+                # Prefer the full chunk text (include_source_text=True);
+                # fall back to the 200-char preview for older API versions.
                 contexts = [
-                    s.get("text_preview", "") for s in resp.get("sources", [])
+                    s.get("text") or s.get("text_preview", "")
+                    for s in resp.get("sources", [])
                 ]
                 enriched.append(
                     {
                         "question": question,
                         "ground_truth": sample["ground_truth"],
                         "ticker": ticker,
+                        "expected_sections": sample.get("expected_sections", []),
                         "answer": resp.get("answer") or "",
                         "contexts": contexts,
                         "sources": resp.get("sources", []),
@@ -175,6 +183,7 @@ async def collect_responses(
                         "question": question,
                         "ground_truth": sample["ground_truth"],
                         "ticker": ticker,
+                        "expected_sections": sample.get("expected_sections", []),
                         "answer": "",
                         "contexts": [],
                         "sources": [],
@@ -186,6 +195,60 @@ async def collect_responses(
                 )
 
     return enriched
+
+
+# ── Retrieval-only metrics (no LLM judge needed) ─────────────────────────────
+
+
+def compute_retrieval_metrics(responses: list[dict[str, Any]]) -> dict[str, float]:
+    """Compute LLM-free retrieval metrics from sources + expected_sections.
+
+    - section_hit_rate: fraction of samples where at least one retrieved
+      chunk comes from an expected 10-K section.
+    - section_mrr: mean reciprocal rank of the first expected-section hit.
+    - ticker_accuracy: fraction of retrieved chunks whose ticker matches
+      the sample's ticker (catches cross-company contamination).
+
+    These run on every sample with retrieved sources, independent of the
+    LLM judge, so retrieval regressions are visible even when generation
+    or judging fails.
+    """
+    hits: list[float] = []
+    reciprocal_ranks: list[float] = []
+    ticker_matches = 0
+    ticker_total = 0
+
+    for r in responses:
+        sources = r.get("sources", [])
+        if not sources:
+            continue
+
+        expected = set(r.get("expected_sections", []))
+        if expected:
+            rank = next(
+                (
+                    i
+                    for i, s in enumerate(sources, start=1)
+                    if s.get("section") in expected
+                ),
+                None,
+            )
+            hits.append(1.0 if rank else 0.0)
+            reciprocal_ranks.append(1.0 / rank if rank else 0.0)
+
+        if r.get("ticker"):
+            for s in sources:
+                ticker_total += 1
+                if s.get("ticker") == r["ticker"]:
+                    ticker_matches += 1
+
+    metrics: dict[str, float] = {}
+    if hits:
+        metrics["section_hit_rate"] = sum(hits) / len(hits)
+        metrics["section_mrr"] = sum(reciprocal_ranks) / len(reciprocal_ranks)
+    if ticker_total:
+        metrics["ticker_accuracy"] = ticker_matches / ticker_total
+    return metrics
 
 
 # ── ragas evaluation ──────────────────────────────────────────────────────────
@@ -203,6 +266,10 @@ def _resolve_ragas_llm() -> tuple[Any, Any, str]:
     openai_key = os.getenv("OPENAI_API_KEY")
     ollama_url = os.getenv("EVAL_OLLAMA_URL", "http://localhost:11434")
     ollama_model = os.getenv("EVAL_OLLAMA_MODEL", "mistral:7b")
+    # ragas AnswerRelevancy needs an embedding model. A chat/reasoning model is a
+    # poor, slow embedder, so allow a dedicated embedding model (e.g. nomic-embed-text)
+    # while the judge LLM stays a capable chat model. Defaults to the judge model.
+    ollama_embed_model = os.getenv("EVAL_OLLAMA_EMBED_MODEL", ollama_model)
 
     if anthropic_key:
         try:
@@ -226,21 +293,25 @@ def _resolve_ragas_llm() -> tuple[Any, Any, str]:
 
     # Fallback: local Ollama (heavy on RAM — stop other services first)
     try:
-        from langchain_community.chat_models import ChatOllama
-        from langchain_community.embeddings import OllamaEmbeddings
+        from langchain_ollama import ChatOllama, OllamaEmbeddings
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from ragas.llms import LangchainLLMWrapper
 
+        # reasoning=False disables chain-of-thought on reasoning models
+        # (e.g. Qwen3): without it the judge spends ~26s "thinking" per call,
+        # turning a 30-sample eval into hours. Harmless for non-reasoning models.
         ragas_llm = LangchainLLMWrapper(
-            ChatOllama(model=ollama_model, base_url=ollama_url)
+            ChatOllama(model=ollama_model, base_url=ollama_url, reasoning=False)
         )
         ragas_emb = LangchainEmbeddingsWrapper(
-            OllamaEmbeddings(model=ollama_model, base_url=ollama_url)
+            OllamaEmbeddings(model=ollama_embed_model, base_url=ollama_url)
         )
         logger.warning(
-            "No API key found — falling back to local Ollama (%s) for ragas judge. "
-            "RAM usage will be high. Set ANTHROPIC_API_KEY for a lighter alternative.",
+            "No API key found — falling back to local Ollama for ragas judge "
+            "(LLM: %s, embeddings: %s). RAM usage will be high. "
+            "Set ANTHROPIC_API_KEY for a lighter alternative.",
             ollama_model,
+            ollama_embed_model,
         )
         return ragas_llm, ragas_emb, f"Ollama/{ollama_model} (local)"
     except ImportError:
@@ -325,6 +396,7 @@ def compute_ragas_metrics(
     """
     try:
         from ragas import evaluate
+        from ragas.run_config import RunConfig
     except ImportError as exc:
         logger.error("Cannot import ragas: %s", exc)
         logger.error("Run:  pip install -r requirements.txt")
@@ -345,9 +417,21 @@ def compute_ragas_metrics(
 
     dataset, metrics, metric_names = _build_ragas_dataset(valid, ragas_llm, ragas_embeddings, judge_label)
 
-    logger.info("Running ragas evaluation (metrics: %s) …", ", ".join(metric_names))
+    # A local single-GPU Ollama judge serves one request at a time, so ragas'
+    # default 16-way concurrency just queues calls until they time out. Serialize
+    # (max_workers=1) with a generous per-call timeout for the local path; API
+    # judges can override via EVAL_RAGAS_MAX_WORKERS.
+    max_workers = int(os.getenv("EVAL_RAGAS_MAX_WORKERS", "1"))
+    call_timeout = int(os.getenv("EVAL_RAGAS_TIMEOUT", "600"))
+    run_config = RunConfig(max_workers=max_workers, timeout=call_timeout)
+
+    logger.info(
+        "Running ragas evaluation (metrics: %s, max_workers: %d) …",
+        ", ".join(metric_names),
+        max_workers,
+    )
     try:
-        result = evaluate(dataset=dataset, metrics=metrics)
+        result = evaluate(dataset=dataset, metrics=metrics, run_config=run_config)
     except Exception as exc:
         logger.error("ragas evaluate() failed: %s", exc)
         return {}, []
@@ -367,6 +451,7 @@ def save_json_report(
     responses: list[dict[str, Any]],
     scores: dict[str, list[float]],
     metric_names: list[str],
+    retrieval_metrics: dict[str, float],
     run_at: str,
 ) -> Path:
     """Write the full per-sample report to results/eval_report_<ts>.json (NFR-9)."""
@@ -380,6 +465,7 @@ def save_json_report(
         "run_at": run_at,
         "total_samples": len(responses),
         "evaluated_samples": len(valid),
+        "retrieval_metrics": retrieval_metrics,
         "aggregate_metrics": {
             name: {
                 "scores": scores.get(name, []),
@@ -419,6 +505,7 @@ def append_markdown_summary(
     scores: dict[str, list[float]],
     metric_names: list[str],
     responses: list[dict[str, Any]],
+    retrieval_metrics: dict[str, float],
     run_at: str,
     report_path: Path,
 ) -> None:
@@ -430,6 +517,11 @@ def append_markdown_summary(
         f"**Samples evaluated:** {len(valid)} / {len(responses)}  ",
         f"**Full report:** `{report_path.relative_to(SCRIPT_DIR.parent.parent)}`\n",
     ]
+
+    if retrieval_metrics:
+        lines.append("**Retrieval metrics (LLM-free):** " + " · ".join(
+            f"{name} = {value:.3f}" for name, value in retrieval_metrics.items()
+        ) + "\n")
 
     if metric_names and valid and scores:
         col_headers = ["Question", "Ticker"] + [
@@ -541,20 +633,27 @@ async def _main(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # ── 4. Compute ragas metrics ──────────────────────────────────────────────
+    # ── 4. Compute retrieval metrics (LLM-free) ───────────────────────────────
+    retrieval_metrics = compute_retrieval_metrics(responses)
+    if retrieval_metrics:
+        print("\n── Retrieval Metrics (LLM-free) " + "─" * 28)
+        for name, value in retrieval_metrics.items():
+            print(f"  {name:<25} {value:.4f}")
+
+    # ── 5. Compute ragas metrics ──────────────────────────────────────────────
     scores, metric_names = compute_ragas_metrics(responses)
 
-    # ── 5. Print aggregate scores to stdout ───────────────────────────────────
+    # ── 6. Print aggregate scores to stdout ───────────────────────────────────
     if metric_names and scores:
         print("\n── Aggregate Scores " + "─" * 40)
         for name in metric_names:
             print(f"  {name:<25} {_mean(scores.get(name, [])):.4f}")
         print()
 
-    # ── 6. Persist results ────────────────────────────────────────────────────
+    # ── 7. Persist results ────────────────────────────────────────────────────
     run_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-    report_path = save_json_report(responses, scores, metric_names, run_at)
-    append_markdown_summary(scores, metric_names, responses, run_at, report_path)
+    report_path = save_json_report(responses, scores, metric_names, retrieval_metrics, run_at)
+    append_markdown_summary(scores, metric_names, responses, retrieval_metrics, run_at, report_path)
 
     return 0
 

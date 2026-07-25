@@ -11,6 +11,7 @@ from src.chunker import (
     chunk_filing,
     count_tokens,
     make_chunk_id,
+    pack_paragraphs,
     split_by_token_window,
     split_into_paragraphs,
     split_into_sections,
@@ -166,3 +167,64 @@ class TestChunkFiling:
         )
         ids = [c.chunk_id for c in chunks]
         assert len(ids) == len(set(ids))  # all unique
+
+
+# ── Paragraph packing ────────────────────────────────────────────
+
+class TestPackParagraphs:
+    def test_empty_list(self) -> None:
+        assert pack_paragraphs([]) == []
+
+    def test_short_paragraphs_are_merged(self) -> None:
+        paragraphs = ["Item 7. MD&A", "Revenue grew 5% year over year.", "Margins expanded."]
+        groups = pack_paragraphs(paragraphs, max_tokens=512)
+        assert len(groups) == 1
+        assert groups[0] == "\n\n".join(paragraphs)
+
+    def test_budget_is_respected(self) -> None:
+        paragraph = "word " * 50  # ~50 tokens
+        groups = pack_paragraphs([paragraph.strip()] * 10, max_tokens=120)
+        assert len(groups) > 1
+        for group in groups:
+            assert count_tokens(group) <= 120
+
+    def test_oversize_paragraph_emitted_alone(self) -> None:
+        small = "A short line."
+        huge = "token " * 600  # exceeds the budget on its own
+        groups = pack_paragraphs([small, huge.strip(), small], max_tokens=512)
+        assert len(groups) == 3
+        assert groups[0] == small
+        assert groups[1] == huge.strip()
+        assert groups[2] == small
+
+    def test_order_is_preserved(self) -> None:
+        paragraphs = [f"Paragraph number {i}." for i in range(20)]
+        groups = pack_paragraphs(paragraphs, max_tokens=30)
+        assert "\n\n".join(groups) == "\n\n".join(paragraphs)
+
+
+# ── Contextual embedding text ────────────────────────────────────
+
+class TestEmbeddingText:
+    def _chunk(self) -> Chunk:
+        return Chunk(
+            chunk_id="x" * 64,
+            accession_number="ACC001",
+            ticker="AAPL",
+            filing_date="2024-11-01",
+            section_name="Item 1A",
+            chunk_index=0,
+            text="The Company faces supply chain risks.",
+            token_count=7,
+        )
+
+    def test_header_contains_filing_identity(self) -> None:
+        chunk = self._chunk()
+        header, body = chunk.embedding_text.split("\n", 1)
+        assert header == "[AAPL | 10-K | filed 2024-11-01 | Item 1A]"
+        assert body == chunk.text
+
+    def test_stored_text_is_unchanged(self) -> None:
+        chunk = self._chunk()
+        _ = chunk.embedding_text
+        assert chunk.text == "The Company faces supply chain risks."
