@@ -65,6 +65,30 @@ data:
 
     CREATE INDEX IF NOT EXISTS idx_chunks_ticker ON document_chunks(ticker);
     CREATE INDEX IF NOT EXISTS idx_chunks_accession ON document_chunks(accession_number);
+  002_hybrid_search_and_facts.sql: |
+    ALTER TABLE document_chunks
+        ADD COLUMN IF NOT EXISTS chunk_tsv tsvector
+        GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED;
+
+    CREATE INDEX IF NOT EXISTS idx_chunks_tsv
+        ON document_chunks USING GIN (chunk_tsv);
+
+    CREATE TABLE IF NOT EXISTS financial_facts (
+        ticker       VARCHAR(10)  NOT NULL,
+        cik          BIGINT       NOT NULL,
+        concept      VARCHAR(120) NOT NULL,
+        label        VARCHAR(120) NOT NULL,
+        unit         VARCHAR(20)  NOT NULL,
+        fiscal_year  INTEGER      NOT NULL,
+        period_end   DATE         NOT NULL,
+        value        NUMERIC      NOT NULL,
+        filed        DATE         NOT NULL,
+        updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (ticker, concept, unit, period_end)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_facts_ticker_year
+        ON financial_facts(ticker, fiscal_year);
 {{- if .Values.prometheus.enabled }}
 ---
 apiVersion: v1

@@ -11,47 +11,53 @@ import numpy as np
 
 from src.rag.prompts import RetrievedChunk
 
+# Unit basis vectors → dot product == cosine similarity, scores stay exact.
+_DIM = 384
+
+
+def _unit(axis: int) -> np.ndarray:
+    vec = np.zeros(_DIM)
+    vec[axis] = 1.0
+    return vec
+
+
+def _row(chunk_id: str, embedding: np.ndarray, score: float = 0.9) -> tuple:
+    return (chunk_id, "AAPL", "2024-11-01", "Item 1A", f"Text of {chunk_id}", embedding, score)
+
+
+def _make_retriever(query_embedding: np.ndarray) -> tuple:
+    """Build a Retriever with mocked model and DB connection."""
+    from src.rag.retriever import Retriever
+
+    with patch("src.rag.retriever.SentenceTransformer") as mock_st_class:
+        mock_model = MagicMock()
+        mock_model.encode.return_value = query_embedding
+        mock_st_class.return_value = mock_model
+        with patch("src.rag.retriever.psycopg2"):
+            retriever = Retriever(dsn="postgresql://fake", model_name="test")
+
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cur
+    mock_conn.closed = False
+    retriever._conn = mock_conn
+    return retriever, mock_cur
+
 
 class TestRetriever:
     """Tests for the Retriever class."""
 
-    @patch("src.rag.retriever.SentenceTransformer")
-    def test_embed_query_returns_list(self, mock_st_class: MagicMock) -> None:
-        """embed_query should return a list of floats."""
-        from src.rag.retriever import Retriever
-
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([0.1] * 384)
-        mock_st_class.return_value = mock_model
-
-        with patch("src.rag.retriever.psycopg2"):
-            retriever = Retriever(dsn="postgresql://fake", model_name="test")
-
+    def test_embed_query_returns_list(self) -> None:
+        retriever, _ = _make_retriever(_unit(0))
         result = retriever.embed_query("What is Apple's revenue?")
         assert isinstance(result, list)
-        assert len(result) == 384
+        assert len(result) == _DIM
 
-    @patch("src.rag.retriever.SentenceTransformer")
-    def test_retrieve_with_ticker_filter(self, mock_st_class: MagicMock) -> None:
-        """retrieve should include a WHERE clause when ticker_filter is set."""
-        from src.rag.retriever import Retriever
-
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([0.1] * 384)
-        mock_st_class.return_value = mock_model
-
-        with patch("src.rag.retriever.psycopg2"):
-            retriever = Retriever(dsn="postgresql://fake", model_name="test")
-
-        # Mock the connection and cursor
-        mock_cur = MagicMock()
-        mock_cur.fetchall.return_value = [
-            ("chunk1", "AAPL", "2024-11-01", "Item 1A", "Risk text...", np.array([0.1] * 384), 0.87),
-        ]
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value = mock_cur
-        mock_conn.closed = False
-        retriever._conn = mock_conn
+    def test_retrieve_with_ticker_filter(self) -> None:
+        """Both legs must include the ticker WHERE clause; the fused chunk
+        carries cosine similarity to the query as relevance_score."""
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
 
         chunks, embedding, emb_ms = retriever.retrieve(
             "What are Apple's risks?", top_k=5, ticker_filter="AAPL"
@@ -59,35 +65,102 @@ class TestRetriever:
 
         assert len(chunks) == 1
         assert chunks[0].ticker == "AAPL"
-        assert chunks[0].relevance_score == 0.87
-        # Verify the SQL included ticker filter
-        executed_sql = mock_cur.execute.call_args[0][0]
-        assert "ticker = %s" in executed_sql
+        # chunk embedding == query embedding → cosine similarity 1.0
+        assert chunks[0].relevance_score == 1.0
+        assert len(embedding) == _DIM
+        # Both legs (vector + lexical) ran, each with the ticker filter.
+        executed = [call[0][0] for call in mock_cur.execute.call_args_list]
+        assert len(executed) == 2
+        for sql in executed:
+            assert "ticker = %s" in sql
 
-    @patch("src.rag.retriever.SentenceTransformer")
-    def test_retrieve_without_ticker_filter(self, mock_st_class: MagicMock) -> None:
-        """retrieve without filter should not have WHERE ticker clause."""
-        from src.rag.retriever import Retriever
-
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([0.1] * 384)
-        mock_st_class.return_value = mock_model
-
-        with patch("src.rag.retriever.psycopg2"):
-            retriever = Retriever(dsn="postgresql://fake", model_name="test")
-
-        mock_cur = MagicMock()
+    def test_retrieve_without_ticker_filter(self) -> None:
+        retriever, mock_cur = _make_retriever(_unit(0))
         mock_cur.fetchall.return_value = []
-        mock_conn = MagicMock()
-        mock_conn.cursor.return_value = mock_cur
-        mock_conn.closed = False
-        retriever._conn = mock_conn
 
         chunks, _, _ = retriever.retrieve("General question", top_k=3)
 
         assert chunks == []
-        executed_sql = mock_cur.execute.call_args[0][0]
-        assert "ticker = %s" not in executed_sql
+        for call in mock_cur.execute.call_args_list:
+            assert "ticker = %s" not in call[0][0]
+
+    def test_retrieve_with_date_filters(self) -> None:
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = []
+
+        retriever.retrieve(
+            "Revenue trends",
+            top_k=3,
+            filing_date_from="2023-01-01",
+            filing_date_to="2024-12-31",
+        )
+
+        for call in mock_cur.execute.call_args_list:
+            sql = call[0][0]
+            assert "filing_date >= %s" in sql
+            assert "filing_date <= %s" in sql
+
+    def test_lexical_failure_degrades_to_vector_only(self) -> None:
+        """If migration 002 is missing, the tsvector query fails — retrieval
+        must still return vector-leg results instead of raising."""
+        retriever, mock_cur = _make_retriever(_unit(0))
+
+        def execute(sql: str, params: object = None) -> None:
+            if "ts_rank_cd" in sql:
+                raise RuntimeError('column "chunk_tsv" does not exist')
+
+        mock_cur.execute.side_effect = execute
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        chunks, _, _ = retriever.retrieve("What are Apple's risks?", top_k=5)
+
+        assert len(chunks) == 1
+        assert chunks[0].chunk_id == "chunk1"
+
+
+class TestFuseRRF:
+    """Tests for Reciprocal Rank Fusion of the two retrieval legs."""
+
+    def test_empty_lists(self) -> None:
+        from src.rag.retriever import _fuse_rrf
+        assert _fuse_rrf([[], []], _unit(0)) == []
+
+    def test_chunk_in_both_legs_outranks_single_leg_chunk(self) -> None:
+        from src.rag.retriever import _fuse_rrf
+        both = _row("in-both", _unit(1))
+        vector_only = _row("vector-only", _unit(2))
+        fused = _fuse_rrf([[vector_only, both], [both]], _unit(0))
+        assert [c.chunk_id for c, _ in fused] == ["in-both", "vector-only"]
+
+    def test_duplicate_chunk_returned_once(self) -> None:
+        from src.rag.retriever import _fuse_rrf
+        row = _row("chunk1", _unit(1))
+        fused = _fuse_rrf([[row], [row]], _unit(0))
+        assert len(fused) == 1
+
+    def test_relevance_is_cosine_with_query(self) -> None:
+        from src.rag.retriever import _fuse_rrf
+        query = _unit(0)
+        aligned = _row("aligned", query.copy())
+        orthogonal = _row("orthogonal", _unit(1))
+        fused = _fuse_rrf([[aligned, orthogonal]], query)
+        scores = {c.chunk_id: c.relevance_score for c, _ in fused}
+        assert scores["aligned"] == 1.0
+        assert scores["orthogonal"] == 0.0
+
+
+class TestBuildFilters:
+    def test_no_filters(self) -> None:
+        from src.rag.retriever import Retriever
+        clauses, params = Retriever._build_filters(None, None, None)
+        assert clauses == []
+        assert params == []
+
+    def test_all_filters(self) -> None:
+        from src.rag.retriever import Retriever
+        clauses, params = Retriever._build_filters("AAPL", "2023-01-01", "2024-12-31")
+        assert clauses == ["ticker = %s", "filing_date >= %s", "filing_date <= %s"]
+        assert params == ["AAPL", "2023-01-01", "2024-12-31"]
 
 
 class TestEmbeddingModelConsistency:

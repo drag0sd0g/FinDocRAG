@@ -149,6 +149,26 @@ tests:
           path: data["001_initial_schema.sql"]
           pattern: "m = 16"
 
+  - it: db-migrations configmap contains the hybrid search migration
+    documentIndex: 1
+    asserts:
+      - isNotEmpty:
+          path: data["002_hybrid_search_and_facts.sql"]
+
+  - it: db-migrations 002 adds the tsvector column for full-text search
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: data["002_hybrid_search_and_facts.sql"]
+          pattern: "chunk_tsv tsvector"
+
+  - it: db-migrations 002 creates the financial_facts table
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: data["002_hybrid_search_and_facts.sql"]
+          pattern: "CREATE TABLE IF NOT EXISTS financial_facts"
+
   # ── prometheus-config configmap (documentIndex 2) ─────────────────
 
   - it: prometheus-config configmap has correct kind

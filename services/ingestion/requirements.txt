@@ -4,6 +4,8 @@
 fastapi==0.115.*
 uvicorn[standard]==0.34.*
 aiohttp==3.11.*
+beautifulsoup4==4.12.*
+lxml==5.3.*
 confluent-kafka==2.6.*
 psycopg2-binary==2.9.*
 pyyaml==6.0.*

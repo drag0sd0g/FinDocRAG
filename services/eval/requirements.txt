@@ -8,3 +8,4 @@ pydantic==2.10.*
 langchain-openai>=0.1.0
 langchain-anthropic>=0.2.0
 langchain-community>=0.2.0
+langchain-ollama>=0.2.0  # local Ollama judge with reasoning=False (Qwen3 etc.)

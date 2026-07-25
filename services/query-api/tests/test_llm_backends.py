@@ -105,6 +105,35 @@ class TestOllamaBackend:
         assert result.prompt_tokens == 0
         assert result.completion_tokens == 0
 
+    @pytest.mark.asyncio
+    async def test_generate_disables_thinking(self) -> None:
+        """Payload must set think=False so reasoning models (Qwen3) return the
+        grounded answer in `response` instead of spending tokens on thinking."""
+        from src.llm.ollama_backend import OllamaBackend
+
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json = AsyncMock(return_value={"response": "4"})
+
+        mock_post_ctx = MagicMock()
+        mock_post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_post_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_post_ctx)
+
+        mock_session_ctx = MagicMock()
+        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.llm.ollama_backend.aiohttp.ClientSession", return_value=mock_session_ctx):
+            backend = OllamaBackend(base_url="http://localhost:11434", model="qwen3.5-122b-ctx")
+            await backend.generate("What is 2+2?", max_tokens=64)
+
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["think"] is False
+        assert payload["options"]["num_predict"] == 64
+
 
 # ── OpenAIBackend ────────────────────────────────────────────────
 

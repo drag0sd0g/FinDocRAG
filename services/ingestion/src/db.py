@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from src.edgar_client import Filing
+    from src.facts import FinancialFact
 
 logger = structlog.get_logger()
 
@@ -98,3 +99,42 @@ class IngestionDB:
             accession=filing.accession_number,
             ticker=filing.ticker,
         )
+
+    def store_financial_facts(self, facts: list[FinancialFact]) -> int:
+        """Upsert XBRL facts into financial_facts; returns the row count written.
+
+        Restated values from later filings overwrite earlier ones
+        (same ticker/concept/unit/period_end key).
+        """
+        if not facts:
+            return 0
+        with self._cursor() as cur:
+            for fact in facts:
+                cur.execute(
+                    """
+                    INSERT INTO financial_facts
+                        (ticker, cik, concept, label, unit, fiscal_year,
+                         period_end, value, filed)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ticker, concept, unit, period_end)
+                    DO UPDATE SET
+                        value = EXCLUDED.value,
+                        label = EXCLUDED.label,
+                        fiscal_year = EXCLUDED.fiscal_year,
+                        filed = EXCLUDED.filed
+                    WHERE EXCLUDED.filed >= financial_facts.filed
+                    """,
+                    (
+                        fact.ticker,
+                        fact.cik,
+                        fact.concept,
+                        fact.label,
+                        fact.unit,
+                        fact.fiscal_year,
+                        fact.period_end,
+                        fact.value,
+                        fact.filed,
+                    ),
+                )
+        logger.info("financial_facts_stored", ticker=facts[0].ticker, count=len(facts))
+        return len(facts)

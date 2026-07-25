@@ -1,9 +1,17 @@
 """Section-aware chunking for 10-K filings.
 
-Implements the three-stage chunking strategy from TDD Section 5.2.2:
+Implements the chunking strategy from TDD Section 5.2.2:
   1. Section split — by 10-K item headers (Item 1, 1A, 7, etc.)
   2. Paragraph split — by double newlines within each section
-  3. Token-based windowing — 512-token windows with 64-token overlap
+  3. Paragraph packing — consecutive paragraphs are greedily packed into
+     chunks of up to 512 tokens, so short paragraphs (headings, single
+     sentences) never become their own low-signal chunks
+  4. Token-based windowing — only paragraphs that alone exceed 512 tokens
+     are split into 512-token windows with 64-token overlap
+
+Each chunk also exposes ``embedding_text`` — the chunk text prefixed with
+a contextual header (ticker, filing date, section) that is embedded but
+not stored, which measurably improves retrieval on corpus-wide queries.
 
 References:
   - TDD: FR-7 (section-aware splitting with 512/64 token window)
@@ -54,6 +62,20 @@ class Chunk:
     chunk_index: int
     text: str
     token_count: int
+
+    @property
+    def embedding_text(self) -> str:
+        """Chunk text prefixed with a contextual header, used for embedding only.
+
+        The header anchors the vector to the filing's identity so that
+        queries like "Apple supply chain risks" match AAPL chunks even when
+        the chunk body never repeats the company name.  The stored/displayed
+        text (``self.text``) is unchanged.
+        """
+        return (
+            f"[{self.ticker} | 10-K | filed {self.filing_date} | {self.section_name}]\n"
+            f"{self.text}"
+        )
 
 
 # ── Tokeniser (cached) ──────────────────────────────────────────
@@ -159,6 +181,44 @@ def split_by_token_window(
     return windows
 
 
+# ── Stage 2b: Paragraph packing ─────────────────────────────────
+
+def pack_paragraphs(paragraphs: list[str], max_tokens: int = DEFAULT_CHUNK_SIZE) -> list[str]:
+    """Greedily pack consecutive paragraphs into groups of ≤ max_tokens.
+
+    Short paragraphs (headings, one-liners, table fragments) are merged
+    with their neighbours instead of becoming their own low-signal chunks.
+    A paragraph that alone exceeds max_tokens is emitted as its own group
+    (the caller window-splits it).
+    """
+    groups: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for paragraph in paragraphs:
+        tokens = count_tokens(paragraph)
+
+        if tokens > max_tokens:
+            if current:
+                groups.append("\n\n".join(current))
+                current, current_tokens = [], 0
+            groups.append(paragraph)  # oversize — window-split downstream
+            continue
+
+        # +1 accounts for the "\n\n" joiner between paragraphs.
+        if current and current_tokens + tokens + 1 > max_tokens:
+            groups.append("\n\n".join(current))
+            current, current_tokens = [], 0
+
+        current.append(paragraph)
+        current_tokens += tokens + 1
+
+    if current:
+        groups.append("\n\n".join(current))
+
+    return groups
+
+
 # ── Public API: full chunking pipeline ───────────────────────────
 
 def chunk_filing(
@@ -169,7 +229,7 @@ def chunk_filing(
     max_tokens: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP,
 ) -> list[Chunk]:
-    """Run the full three-stage chunking pipeline on a filing.
+    """Run the full chunking pipeline on a filing.
 
     Returns a list of Chunk objects ready for embedding and storage.
     Implements FR-7, FR-8.
@@ -181,9 +241,10 @@ def chunk_filing(
 
     for section_name, section_text in sections:
         paragraphs = split_into_paragraphs(section_text)
+        groups = pack_paragraphs(paragraphs, max_tokens)
 
-        for paragraph in paragraphs:
-            windows = split_by_token_window(paragraph, max_tokens, overlap)
+        for group in groups:
+            windows = split_by_token_window(group, max_tokens, overlap)
 
             for window_text in windows:
                 token_count = count_tokens(window_text)

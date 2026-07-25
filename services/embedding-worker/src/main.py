@@ -55,6 +55,7 @@ POSTGRES_DSN = (
     f"/{os.getenv('POSTGRES_DB', 'findocdrag')}"
 )
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 TOPIC_RAW = "filings.raw"
@@ -186,10 +187,11 @@ def _process_filing(
     for c in chunks:
         CHUNK_TOKENS.observe(c.token_count)
 
-    # Embed (with batch duration timing)
-    texts = [c.text for c in chunks]
+    # Embed (with batch duration timing).  embedding_text prefixes each
+    # chunk with its filing context header — embedded, never stored.
+    texts = [c.embedding_text for c in chunks]
     t0 = time.perf_counter()
-    embeddings = embedder.embed(texts)
+    embeddings = embedder.embed(texts, batch_size=EMBEDDING_BATCH_SIZE)
     embed_elapsed = time.perf_counter() - t0
     BATCH_DURATION.observe(embed_elapsed)
 

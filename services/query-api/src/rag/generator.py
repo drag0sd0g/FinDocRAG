@@ -15,6 +15,7 @@ import structlog
 
 if TYPE_CHECKING:
     from src.llm.backend import LLMBackend, LLMResponse
+    from src.rag.facts import FactsRepository
     from src.rag.retriever import Retriever
 
 from src.metrics import (
@@ -32,11 +33,17 @@ logger = structlog.get_logger()
 
 
 class RAGGenerator:
-    """Orchestrates the full RAG pipeline: retrieve → prompt → generate."""
+    """Orchestrates the full RAG pipeline: retrieve → facts → prompt → generate."""
 
-    def __init__(self, retriever: Retriever, llm: LLMBackend) -> None:
+    def __init__(
+        self,
+        retriever: Retriever,
+        llm: LLMBackend,
+        facts: FactsRepository | None = None,
+    ) -> None:
         self._retriever = retriever
         self._llm = llm
+        self._facts = facts
 
     def _record_llm_metrics(
         self,
@@ -58,6 +65,9 @@ class RAGGenerator:
         question: str,
         top_k: int = 5,
         ticker_filter: str | None = None,
+        filing_date_from: str | None = None,
+        filing_date_to: str | None = None,
+        include_source_text: bool = False,
     ) -> QueryResponse:
         """Run the full RAG pipeline and return a QueryResponse.
 
@@ -75,6 +85,8 @@ class RAGGenerator:
             question=question,
             top_k=top_k,
             ticker_filter=ticker_filter,
+            filing_date_from=filing_date_from,
+            filing_date_to=filing_date_to,
         )
         retrieval_ms = (time.perf_counter() - t0_retrieve) * 1000 - embedding_ms
 
@@ -86,6 +98,15 @@ class RAGGenerator:
         if chunks:
             RETRIEVAL_SCORE.observe(chunks[0].relevance_score)
 
+        # ── Structured XBRL facts ────────────────────────────────
+        # For numeric financial questions with a ticker filter, prepend
+        # authoritative XBRL facts so figures come from structured data,
+        # not prose retrieval.
+        if self._facts is not None:
+            fact_chunks = self._facts.facts_for_question(question, ticker_filter)
+            if fact_chunks:
+                chunks = fact_chunks + chunks
+
         # Build sources for the response (FR-17)
         sources = [
             SourceChunk(
@@ -95,6 +116,7 @@ class RAGGenerator:
                 section=c.section,
                 relevance_score=round(c.relevance_score, 4),
                 text_preview=c.text[:200],
+                text=c.text if include_source_text else None,
             )
             for c in chunks
         ]

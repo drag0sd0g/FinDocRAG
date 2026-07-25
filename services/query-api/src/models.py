@@ -10,6 +10,8 @@ References:
 
 from __future__ import annotations
 
+import datetime
+
 from pydantic import BaseModel, Field, field_validator
 
 # ── Query endpoint ───────────────────────────────────────────────
@@ -19,6 +21,13 @@ class QueryRequest(BaseModel):
 
     question: str
     ticker_filter: str | None = None
+    # Optional filing-date window (ISO dates). Useful when several years of
+    # 10-Ks are ingested and the question targets a specific period.
+    filing_date_from: str | None = None
+    filing_date_to: str | None = None
+    # When true, each source includes the full chunk text alongside the
+    # 200-char preview (used by the evaluation harness for ragas scoring).
+    include_source_text: bool = False
     # Upper bound of 20 is a context-window budget: at ~512 tokens per chunk,
     # 20 chunks consume ~10 K tokens, leaving headroom for the system prompt,
     # question, and answer inside a 32 K-token context window.  Raise the cap
@@ -32,6 +41,14 @@ class QueryRequest(BaseModel):
             raise ValueError("question must not be empty or whitespace")
         return v.strip()
 
+    @field_validator("filing_date_from", "filing_date_to")
+    @classmethod
+    def date_must_be_iso(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        datetime.date.fromisoformat(v)  # raises ValueError if malformed
+        return v
+
 
 class SourceChunk(BaseModel):
     """A single source chunk returned alongside the answer (FR-17)."""
@@ -42,6 +59,7 @@ class SourceChunk(BaseModel):
     section: str
     relevance_score: float
     text_preview: str  # first 200 characters
+    text: str | None = None  # full chunk text, only when include_source_text
 
 
 class TimingInfo(BaseModel):
