@@ -4,6 +4,7 @@
 confluent-kafka==2.6.*
 psycopg2-binary==2.9.*
 sentence-transformers==3.3.*
+einops==0.8.*  # required by nomic-embed-text's custom nomic-bert model
 tiktoken==0.8.*
 pgvector==0.3.*
 structlog==24.4.*

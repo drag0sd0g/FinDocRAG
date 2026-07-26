@@ -103,7 +103,7 @@ class TestStoreChunks:
             text="Business description.",
             token_count=5,
         )
-        embedding = [0.1] * 384
+        embedding = [0.1] * 768
 
         result = store.store_chunks([chunk], [embedding])
 
@@ -145,7 +145,7 @@ class TestStoreChunks:
         )
 
         with contextlib.suppress(RuntimeError):
-            store.store_chunks([chunk], [[0.1] * 384])
+            store.store_chunks([chunk], [[0.1] * 768])
 
         mock_conn.rollback.assert_called_once()
         mock_cur.close.assert_called_once()

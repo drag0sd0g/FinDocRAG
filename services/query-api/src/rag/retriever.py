@@ -41,7 +41,12 @@ from src.rag.prompts import RetrievedChunk
 
 logger = structlog.get_logger()
 
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+
+# nomic is an asymmetric-retrieval model: the query side is prefixed with
+# ``search_query:`` (documents get ``search_document:`` in the embedding
+# worker). The two prefixes MUST match the ingestion side or retrieval degrades.
+DEFAULT_QUERY_PREFIX = "search_query: "
 
 # How many candidates each leg fetches before fusion and MMR reranking.
 # 4× top_k gives the algorithm enough diversity headroom without a
@@ -151,11 +156,20 @@ def _fuse_rrf(
 class Retriever:
     """Embeds a query and retrieves the top-k most similar chunks."""
 
-    def __init__(self, dsn: str, model_name: str = DEFAULT_MODEL) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        model_name: str = DEFAULT_MODEL,
+        *,
+        query_prefix: str = DEFAULT_QUERY_PREFIX,
+    ) -> None:
         self._dsn = dsn
         self._conn: psycopg2.extensions.connection | None = None
+        self._query_prefix = query_prefix
         logger.info("retriever_loading_model", model=model_name)
-        self._model = SentenceTransformer(model_name)
+        # trust_remote_code: nomic ships a custom BERT (nomic-bert-2048); the
+        # flag is ignored by standard sentence-transformers models.
+        self._model = SentenceTransformer(model_name, trust_remote_code=True)
         logger.info("retriever_model_loaded", model=model_name)
 
     def connect(self) -> None:
@@ -187,9 +201,13 @@ class Retriever:
             cur.close()
 
     def embed_query(self, question: str) -> list[float]:
-        """Embed a user's question using the same model as ingestion (FR-13)."""
+        """Embed a user's question using the same model as ingestion (FR-13).
+
+        The ``search_query:`` task prefix mirrors the ``search_document:``
+        prefix applied to chunks at ingestion time (asymmetric retrieval).
+        """
         embedding = self._model.encode(
-            question,
+            f"{self._query_prefix}{question}",
             normalize_embeddings=True,
             show_progress_bar=False,
         )
@@ -199,7 +217,7 @@ class Retriever:
         """Compare the loaded model's output dimension against stored embeddings.
 
         Called at startup to detect silent model mismatches — e.g. the embedding
-        worker used all-MiniLM-L6-v2 (384-dim) but the query API is now configured
+        worker used nomic-embed-text (768-dim) but the query API is now configured
         with a different model. A dimension mismatch will corrupt all retrieval
         results silently at query time.
 

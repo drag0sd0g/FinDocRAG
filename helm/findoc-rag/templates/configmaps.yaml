@@ -55,7 +55,7 @@ data:
         chunk_index      INTEGER      NOT NULL,
         chunk_text       TEXT         NOT NULL,
         token_count      INTEGER      NOT NULL,
-        embedding        vector(384)  NOT NULL,
+        embedding        vector(768)  NOT NULL,
         created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     );
 
@@ -89,6 +89,30 @@ data:
 
     CREATE INDEX IF NOT EXISTS idx_facts_ticker_year
         ON financial_facts(ticker, fiscal_year);
+  003_embedding_nomic_768.sql: |
+    -- Guarded 384 -> 768 embedding upgrade (nomic-embed-text-v1.5). Only runs
+    -- while the column is still vector(384); a no-op on fresh 768 installs, so
+    -- it is safe to re-apply on every startup.
+    DO $$
+    DECLARE
+        current_dim integer;
+    BEGIN
+        SELECT atttypmod INTO current_dim
+        FROM pg_attribute
+        WHERE attrelid = 'document_chunks'::regclass
+          AND attname = 'embedding'
+          AND NOT attisdropped;
+
+        IF current_dim = 384 THEN
+            DROP INDEX IF EXISTS idx_chunks_embedding;
+            TRUNCATE document_chunks, ingestion_log CASCADE;
+            ALTER TABLE document_chunks
+                ALTER COLUMN embedding TYPE vector(768);
+            CREATE INDEX idx_chunks_embedding ON document_chunks
+                USING hnsw (embedding vector_cosine_ops)
+                WITH (m = 16, ef_construction = 200);
+        END IF;
+    END $$;
 {{- if .Values.prometheus.enabled }}
 ---
 apiVersion: v1

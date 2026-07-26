@@ -248,7 +248,7 @@ class TestConsumeLoop:
 
         # Set up global state
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [[0.1] * 384]
+        mock_embedder.embed.return_value = [[0.1] * 768]
         mock_store = MagicMock()
         main_mod._embedder = mock_embedder
         main_mod._store = mock_store
@@ -456,7 +456,7 @@ class TestConsumeLoop:
         from src.chunker import Chunk
 
         mock_embedder = MagicMock()
-        mock_embedder.embed.return_value = [[0.1] * 384]
+        mock_embedder.embed.return_value = [[0.1] * 768]
         mock_store = MagicMock()
         main_mod._embedder = mock_embedder
         main_mod._store = mock_store

@@ -35,7 +35,7 @@ CREATE TABLE document_chunks (
     chunk_index      INTEGER      NOT NULL,
     chunk_text       TEXT         NOT NULL,
     token_count      INTEGER      NOT NULL,
-    embedding        vector(384)  NOT NULL,     -- all-MiniLM-L6-v2 output dimension
+    embedding        vector(768)  NOT NULL,     -- nomic-embed-text-v1.5 output dimension
     created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 

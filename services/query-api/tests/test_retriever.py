@@ -12,7 +12,7 @@ import numpy as np
 from src.rag.prompts import RetrievedChunk
 
 # Unit basis vectors → dot product == cosine similarity, scores stay exact.
-_DIM = 384
+_DIM = 768
 
 
 def _unit(axis: int) -> np.ndarray:
@@ -52,6 +52,16 @@ class TestRetriever:
         result = retriever.embed_query("What is Apple's revenue?")
         assert isinstance(result, list)
         assert len(result) == _DIM
+
+    def test_embed_query_applies_search_query_prefix(self) -> None:
+        """Query side must carry the asymmetric search_query: prefix."""
+        from src.rag.retriever import DEFAULT_QUERY_PREFIX
+
+        retriever, _ = _make_retriever(_unit(0))
+        retriever.embed_query("What is Apple's revenue?")
+
+        called_text = retriever._model.encode.call_args.args[0]
+        assert called_text == f"{DEFAULT_QUERY_PREFIX}What is Apple's revenue?"
 
     def test_retrieve_with_ticker_filter(self) -> None:
         """Both legs must include the ticker WHERE clause; the fused chunk
@@ -172,14 +182,14 @@ class TestEmbeddingModelConsistency:
         from src.rag.retriever import Retriever
 
         mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.get_sentence_embedding_dimension.return_value = 768
         mock_st_class.return_value = mock_model
 
         with patch("src.rag.retriever.psycopg2"):
             retriever = Retriever(dsn="postgresql://fake", model_name="test")
 
         mock_cur = MagicMock()
-        mock_cur.fetchone.return_value = (384,)
+        mock_cur.fetchone.return_value = (768,)
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cur
         mock_conn.closed = False
@@ -195,14 +205,14 @@ class TestEmbeddingModelConsistency:
         from src.rag.retriever import Retriever
 
         mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.get_sentence_embedding_dimension.return_value = 768
         mock_st_class.return_value = mock_model
 
         with patch("src.rag.retriever.psycopg2"):
             retriever = Retriever(dsn="postgresql://fake", model_name="test")
 
         mock_cur = MagicMock()
-        mock_cur.fetchone.return_value = (768,)  # mismatch!
+        mock_cur.fetchone.return_value = (384,)  # stale all-MiniLM dim → mismatch!
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cur
         mock_conn.closed = False
@@ -212,8 +222,8 @@ class TestEmbeddingModelConsistency:
             retriever.verify_embedding_model_consistency()
             mock_logger.error.assert_called_once()
             call_kwargs = mock_logger.error.call_args[1]
-            assert call_kwargs["stored_dim"] == 768
-            assert call_kwargs["model_dim"] == 384
+            assert call_kwargs["stored_dim"] == 384
+            assert call_kwargs["model_dim"] == 768
 
     @patch("src.rag.retriever.SentenceTransformer")
     def test_skips_check_when_no_data(self, mock_st_class: MagicMock) -> None:
@@ -221,7 +231,7 @@ class TestEmbeddingModelConsistency:
         from src.rag.retriever import Retriever
 
         mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
+        mock_model.get_sentence_embedding_dimension.return_value = 768
         mock_st_class.return_value = mock_model
 
         with patch("src.rag.retriever.psycopg2"):

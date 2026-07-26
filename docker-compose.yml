@@ -227,7 +227,7 @@ services:
       POSTGRES_USER: findocdrag
       POSTGRES_PASSWORD: changeme
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      EMBEDDING_MODEL: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}"
       EMBEDDING_BATCH_SIZE: "${EMBEDDING_BATCH_SIZE:-64}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     ports:
@@ -265,7 +265,7 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_MODEL: "${CLAUDE_MODEL:-claude-opus-4-6}"
-      EMBEDDING_MODEL: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}"
       API_KEYS: "${API_KEYS:-dev-key-1,dev-key-2}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     ports:

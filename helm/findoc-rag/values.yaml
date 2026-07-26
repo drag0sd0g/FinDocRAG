@@ -80,7 +80,7 @@ embeddingWorker:
   image: ghcr.io/drag0sd0g/findoc-rag/embedding-worker:e8e62bf
   replicas: 2
   port: 8002
-  embeddingModel: "sentence-transformers/all-MiniLM-L6-v2"
+  embeddingModel: "nomic-ai/nomic-embed-text-v1.5"
   logLevel: INFO
   resources:
     requests:
@@ -96,7 +96,7 @@ queryApi:
   port: 8000
   llmBackend: ollama
   ollamaModel: mistral:7b
-  embeddingModel: "sentence-transformers/all-MiniLM-L6-v2"
+  embeddingModel: "nomic-ai/nomic-embed-text-v1.5"
   apiKeys: "dev-key-1,dev-key-2"
   openaiApiKey: ""
   logLevel: INFO
