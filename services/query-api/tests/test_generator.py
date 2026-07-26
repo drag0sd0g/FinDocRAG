@@ -61,7 +61,7 @@ class TestRAGGenerator:
                     section="Item 1A", relevance_score=0.87, text="Supply chain risks...",
                 ),
             ],
-            [0.1] * 384,
+            [0.1] * 768,
             12.0,  # embedding_ms
         )
 
@@ -96,7 +96,7 @@ class TestRAGGenerator:
                     section="Item 1A", relevance_score=0.87, text="Some text",
                 ),
             ],
-            [0.1] * 384,
+            [0.1] * 768,
             10.0,
         )
 
@@ -115,7 +115,7 @@ class TestRAGGenerator:
     async def test_no_chunks_returns_no_answer(self) -> None:
         """If no chunks retrieved, no prompt is sent to LLM."""
         mock_retriever = MagicMock()
-        mock_retriever.retrieve.return_value = ([], [0.1] * 384, 8.0)
+        mock_retriever.retrieve.return_value = ([], [0.1] * 768, 8.0)
 
         mock_llm = AsyncMock()
         mock_llm.model_name = "test-model"

@@ -54,7 +54,7 @@ POSTGRES_DSN = (
     f":{os.getenv('POSTGRES_PORT', '5432')}"
     f"/{os.getenv('POSTGRES_DB', 'findocdrag')}"
 )
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

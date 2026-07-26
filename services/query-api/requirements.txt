@@ -6,6 +6,7 @@ uvicorn[standard]==0.34.*
 psycopg2-binary==2.9.*
 pgvector==0.3.*
 sentence-transformers==3.3.*
+einops==0.8.*  # required by nomic-embed-text's custom nomic-bert model
 aiohttp==3.11.*
 openai==1.58.*
 anthropic>=0.40.0

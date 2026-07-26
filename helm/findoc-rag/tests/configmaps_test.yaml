@@ -75,7 +75,7 @@ tests:
     asserts:
       - equal:
           path: data.EMBEDDING_MODEL
-          value: sentence-transformers/all-MiniLM-L6-v2
+          value: nomic-ai/nomic-embed-text-v1.5
 
   - it: app-config configmap has LLM_BACKEND set from values
     documentIndex: 0
@@ -135,12 +135,12 @@ tests:
           path: data["001_initial_schema.sql"]
           pattern: "CREATE TABLE IF NOT EXISTS ingestion_log"
 
-  - it: db-migrations SQL creates document_chunks table with vector(384)
+  - it: db-migrations SQL creates document_chunks table with vector(768)
     documentIndex: 1
     asserts:
       - matchRegex:
           path: data["001_initial_schema.sql"]
-          pattern: "vector\\(384\\)"
+          pattern: "vector\\(768\\)"
 
   - it: db-migrations SQL creates HNSW index with m=16
     documentIndex: 1
@@ -168,6 +168,16 @@ tests:
       - matchRegex:
           path: data["002_hybrid_search_and_facts.sql"]
           pattern: "CREATE TABLE IF NOT EXISTS financial_facts"
+
+  - it: db-migrations 003 guards the 384->768 embedding upgrade
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: data["003_embedding_nomic_768.sql"]
+          pattern: "vector\\(768\\)"
+      - matchRegex:
+          path: data["003_embedding_nomic_768.sql"]
+          pattern: "current_dim = 384"
 
   # ── prometheus-config configmap (documentIndex 2) ─────────────────
 

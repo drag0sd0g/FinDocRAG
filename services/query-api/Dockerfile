@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 
-# Pre-download the embedding model so it's baked into the image
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+# Pre-download the embedding model so it's baked into the image (no slow
+# first-boot download). trust_remote_code loads nomic's custom nomic-bert.
+ARG EMBEDDING_MODEL=nomic-ai/nomic-embed-text-v1.5
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}', trust_remote_code=True)"
 
 EXPOSE 8000
 

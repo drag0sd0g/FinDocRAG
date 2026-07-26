@@ -1,5 +1,9 @@
 [日本語](README.ja.md)
 
+<p align="center">
+  <img src="docs/assets/findocdrag-logo.png" alt="FinDocDRAG — RAG processing SEC EDGAR filings" width="820" />
+</p>
+
 # FinDoc RAG
 
 A Retrieval-Augmented Generation platform for financial document intelligence. FinDoc RAG ingests SEC 10-K filings, chunks and embeds them into a vector store, and exposes a REST API that answers natural language questions with cited sources.
