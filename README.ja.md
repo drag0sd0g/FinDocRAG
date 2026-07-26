@@ -1,5 +1,9 @@
 [English](README.md)
 
+<p align="center">
+  <img src="docs/assets/findocdrag-logo.png" alt="FinDocDRAG — RAG processing SEC EDGAR filings" width="820" />
+</p>
+
 # FinDoc RAG
 
 金融ドキュメントインテリジェンスのための Retrieval-Augmented Generation プラットフォームです。FinDoc RAG は SEC の 10-K 提出書類を取り込み、チャンクに分割してベクターストアに埋め込み、引用元付きで自然言語の質問に回答する REST API を公開します。
