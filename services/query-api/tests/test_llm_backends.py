@@ -135,6 +135,91 @@ class TestOllamaBackend:
         assert payload["options"]["num_predict"] == 64
 
 
+class TestOllamaContextWindow:
+    """Ollama defaults num_ctx to 4096 and silently drops the overflow from the
+    START of the prompt — taking the system prompt and citation instruction
+    with it.  A top_k=5 RAG prompt already approaches that, and injected XBRL
+    facts push it over, so num_ctx must be requested explicitly.
+    """
+
+    @staticmethod
+    def _mock_session() -> MagicMock:
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json = AsyncMock(return_value={"response": "ok"})
+
+        mock_post_ctx = MagicMock()
+        mock_post_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_post_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_post_ctx)
+        return mock_session
+
+    @staticmethod
+    def _session_ctx(mock_session: MagicMock) -> MagicMock:
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_payload_requests_an_explicit_context_window(self) -> None:
+        from src.llm.ollama_backend import DEFAULT_NUM_CTX, OllamaBackend
+
+        mock_session = self._mock_session()
+        with patch(
+            "src.llm.ollama_backend.aiohttp.ClientSession",
+            return_value=self._session_ctx(mock_session),
+        ):
+            backend = OllamaBackend(base_url="http://localhost:11434", model="mistral:7b")
+            await backend.generate("prompt")
+
+        options = mock_session.post.call_args.kwargs["json"]["options"]
+        assert options["num_ctx"] == DEFAULT_NUM_CTX
+
+    @pytest.mark.asyncio
+    async def test_context_window_is_configurable(self) -> None:
+        from src.llm.ollama_backend import OllamaBackend
+
+        mock_session = self._mock_session()
+        with patch(
+            "src.llm.ollama_backend.aiohttp.ClientSession",
+            return_value=self._session_ctx(mock_session),
+        ):
+            backend = OllamaBackend(
+                base_url="http://localhost:11434", model="mistral:7b", num_ctx=32768
+            )
+            await backend.generate("prompt")
+
+        assert mock_session.post.call_args.kwargs["json"]["options"]["num_ctx"] == 32768
+
+    def test_default_holds_a_top_k_5_rag_prompt(self) -> None:
+        """Guards the default against being lowered below a realistic prompt."""
+        from src.llm.ollama_backend import DEFAULT_NUM_CTX
+
+        chunk_tokens = 512 * 5      # top_k=5 chunks at the chunker's budget
+        answer_tokens = 1024        # generator's max_tokens
+        assert chunk_tokens + answer_tokens <= DEFAULT_NUM_CTX
+
+    def test_oversized_prompt_is_flagged_not_silently_truncated(self) -> None:
+        from src.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(model="mistral:7b", num_ctx=1024)
+        with patch("src.llm.ollama_backend.logger") as mock_logger:
+            backend._warn_if_context_exceeded("x" * 40_000, max_tokens=1024)
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.args[0] == "ollama_prompt_may_exceed_context"
+
+    def test_prompt_within_budget_is_not_flagged(self) -> None:
+        from src.llm.ollama_backend import OllamaBackend
+
+        backend = OllamaBackend(model="mistral:7b", num_ctx=8192)
+        with patch("src.llm.ollama_backend.logger") as mock_logger:
+            backend._warn_if_context_exceeded("short prompt", max_tokens=1024)
+        mock_logger.warning.assert_not_called()
+
+
 # ── OpenAIBackend ────────────────────────────────────────────────
 
 

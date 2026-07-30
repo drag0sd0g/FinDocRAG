@@ -87,6 +87,96 @@ class TestSplitIntoSections:
         assert "Item 1" in names
 
 
+# ── Stage 1: table-of-contents handling ─────────────────────────
+
+def _filing_with_toc() -> str:
+    """A miniature 10-K: cover page, table of contents, then the real body.
+
+    Every real filing names each item twice — once as a TOC row with a page
+    number, once as the header of the actual section.
+    """
+    return (
+        "UNITED STATES SECURITIES AND EXCHANGE COMMISSION\n"
+        "Annual Report on Form 10-K\n"
+        "\n"
+        "TABLE OF CONTENTS\n"
+        "Item 1. Business 3\n"
+        "Item 1A. Risk Factors 12\n"
+        "Item 7. Management's Discussion and Analysis 40\n"
+        "\n"
+        "Item 1. Business\n"
+        "The Company designs and sells consumer electronics worldwide. " * 12 + "\n"
+        "Item 1A. Risk Factors\n"
+        "The Company depends on a concentrated supply chain in Asia. " * 12 + "\n"
+        "Item 7. Management's Discussion and Analysis\n"
+        "Total net sales increased 2% year over year to $391.0 billion. " * 12
+    )
+
+
+class TestTableOfContentsHandling:
+    def test_each_item_yields_exactly_one_section(self) -> None:
+        """TOC rows must not create a second section for the same item."""
+        sections = split_into_sections(_filing_with_toc())
+        names = [name for name, _ in sections]
+        for item in ("Item 1", "Item 1A", "Item 7"):
+            assert names.count(item) == 1, f"{item} appeared {names.count(item)} times"
+
+    def test_sections_hold_body_text_not_toc_rows(self) -> None:
+        """The kept boundary must be the body header, not the TOC row."""
+        sections = dict(split_into_sections(_filing_with_toc()))
+        assert "concentrated supply chain" in sections["Item 1A"]
+        assert "Total net sales increased" in sections["Item 7"]
+
+    def test_toc_rows_land_in_the_preamble(self) -> None:
+        """Losing boundaries are absorbed, never dropped — no text is lost."""
+        sections = dict(split_into_sections(_filing_with_toc()))
+        assert "TABLE OF CONTENTS" in sections["Preamble"]
+        # The page-numbered TOC row stays with the TOC, out of the body sections.
+        assert "Risk Factors 12" in sections["Preamble"]
+        assert "Risk Factors 12" not in sections["Item 1A"]
+
+    def test_body_text_is_not_mislabelled_by_a_toc_row(self) -> None:
+        """Regression: body prose must carry its own item's section name.
+
+        With every TOC row treated as a boundary, the last TOC row swallowed
+        the text that followed it, so real Item 1 prose was labelled with
+        whichever item the TOC happened to list last.
+        """
+        sections = dict(split_into_sections(_filing_with_toc()))
+        assert "designs and sells consumer electronics" in sections["Item 1"]
+
+    def test_no_text_is_lost(self) -> None:
+        sections = split_into_sections(_filing_with_toc())
+        recombined = "".join(text for _, text in sections)
+        assert "designs and sells consumer electronics" in recombined
+        assert "concentrated supply chain" in recombined
+        assert "Total net sales increased" in recombined
+
+    def test_duplicate_item_keeps_the_longer_span(self) -> None:
+        """A passing mention loses to the section that actually holds the body."""
+        text = (
+            "Cover.\n"
+            "Item 3. Legal Proceedings 5\n"
+            "Item 3. Legal Proceedings\n"
+            + "The Company is party to various legal proceedings. " * 20
+        )
+        sections = dict(split_into_sections(text))
+        assert "The Company is party" in sections["Item 3"]
+        # The TOC row (title plus page number) stayed behind in the Preamble.
+        assert "Legal Proceedings 5" not in sections["Item 3"]
+        assert "Legal Proceedings 5" in sections["Preamble"]
+
+    def test_single_occurrence_is_unaffected(self) -> None:
+        """Documents without a TOC keep their original one-section-per-item split."""
+        text = (
+            "Cover page.\n"
+            "Item 1. Business\nWe sell things.\n"
+            "Item 7. MD&A\nRevenue grew."
+        )
+        names = [name for name, _ in split_into_sections(text)]
+        assert names == ["Preamble", "Item 1", "Item 7"]
+
+
 # ── Stage 2: Paragraph split ────────────────────────────────────
 
 class TestSplitIntoParagraphs:

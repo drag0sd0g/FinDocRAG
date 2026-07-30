@@ -128,19 +128,20 @@ The Query API needs an LLM to generate cited answers from retrieved context. The
 
 The triple-backend approach satisfies multiple deployment scenarios. For local development and portfolio demonstration, the system must start with `docker compose --profile local-llm up` and work without any API key -- Ollama provides this. For evaluation and quality comparison, both OpenAI's GPT-4o-mini and Anthropic's Claude produce measurably better answers than a locally-run 7B model. Claude is particularly useful for developers who have an Anthropic subscription but not an OpenAI key, and vice versa.
 
-Ollama is made opt-in via Docker Compose profiles (`--profile local-llm`). Running without the profile skips the Ollama container entirely, reducing the stack's RAM footprint by ~6 GB and avoiding a multi-GB model download -- this makes remote-backend workflows significantly faster to start.
+Ollama is made opt-in via Docker Compose profiles (`--profile local-llm`). Running without the profile skips the Ollama container entirely, freeing whatever the chosen model would have occupied and avoiding a multi-GB model download -- this makes remote-backend workflows significantly faster to start. It is also the path used when pointing the stack at a host-native Ollama, which is how the local backend gets GPU acceleration: containers on macOS and Windows cannot reach the host GPU.
 
 A LangChain-based abstraction was rejected because it introduces a large transitive dependency tree for what is ultimately a single `generate(prompt) -> text` call. The custom `LLMBackend` Protocol is 10 lines of code and does exactly what we need without framework coupling.
 
-vLLM and TGI are production inference servers designed for GPU-backed, high-throughput serving. They are not suitable for a CPU-only Docker Compose demo environment.
+vLLM and TGI are production inference servers designed for GPU-backed, high-throughput serving. They are heavier than this system needs for a portable Docker Compose environment, where the containerised runtime has no GPU access anyway.
 
 ### Consequences
 
 - Positive: System works fully offline out of the box (Ollama profile) and with remote APIs when Ollama is impractical.
 - Positive: Evaluation harness can compare Ollama, OpenAI, and Claude quality side by side.
 - Positive: Minimal abstraction layer (Protocol + three implementations) is easy to understand and test.
-- Positive: Ollama is opt-in via Docker Compose profiles; remote-backend setups skip the ~6 GB model download.
-- Negative: Ollama with Mistral 7B requires approximately 6 GB of RAM, which is significant in memory-constrained environments (TinyLlama at 637 MB is a documented fallback).
+- Positive: Ollama is opt-in via Docker Compose profiles; remote-backend setups skip the model download entirely.
+- Positive: The same profile switch allows a host-native Ollama to be used instead, which is the only way to get GPU-accelerated local inference on macOS and Windows.
+- Negative: Local model size and memory use scale with the model chosen via `OLLAMA_MODEL`; a smaller model is the documented fallback on constrained machines.
 - Negative: Three code paths means all three backends need test coverage.
 
 ---

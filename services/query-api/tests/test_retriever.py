@@ -5,6 +5,7 @@ The embedding model and database are mocked — no real resources needed.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,6 +24,15 @@ def _unit(axis: int) -> np.ndarray:
 
 def _row(chunk_id: str, embedding: np.ndarray, score: float = 0.9) -> tuple:
     return (chunk_id, "AAPL", "2024-11-01", "Item 1A", f"Text of {chunk_id}", embedding, score)
+
+
+def _search_sql(mock_cur: MagicMock) -> list[str]:
+    """Executed statements, excluding the HNSW tuning SETs that precede them."""
+    return [
+        call.args[0]
+        for call in mock_cur.execute.call_args_list
+        if not call.args[0].lstrip().upper().startswith("SET ")
+    ]
 
 
 def _make_retriever(query_embedding: np.ndarray) -> tuple:
@@ -79,7 +89,7 @@ class TestRetriever:
         assert chunks[0].relevance_score == 1.0
         assert len(embedding) == _DIM
         # Both legs (vector + lexical) ran, each with the ticker filter.
-        executed = [call[0][0] for call in mock_cur.execute.call_args_list]
+        executed = _search_sql(mock_cur)
         assert len(executed) == 2
         for sql in executed:
             assert "ticker = %s" in sql
@@ -91,8 +101,8 @@ class TestRetriever:
         chunks, _, _ = retriever.retrieve("General question", top_k=3)
 
         assert chunks == []
-        for call in mock_cur.execute.call_args_list:
-            assert "ticker = %s" not in call[0][0]
+        for sql in _search_sql(mock_cur):
+            assert "ticker = %s" not in sql
 
     def test_retrieve_with_date_filters(self) -> None:
         retriever, mock_cur = _make_retriever(_unit(0))
@@ -105,8 +115,7 @@ class TestRetriever:
             filing_date_to="2024-12-31",
         )
 
-        for call in mock_cur.execute.call_args_list:
-            sql = call[0][0]
+        for sql in _search_sql(mock_cur):
             assert "filing_date >= %s" in sql
             assert "filing_date <= %s" in sql
 
@@ -126,6 +135,237 @@ class TestRetriever:
 
         assert len(chunks) == 1
         assert chunks[0].chunk_id == "chunk1"
+
+
+class TestHnswTuning:
+    """pgvector caps HNSW candidates at hnsw.ef_search (default 40).
+
+    Requesting more rows than that silently returns fewer, lower-quality
+    neighbours, which starves RRF and MMR of material to work with.
+    """
+
+    @staticmethod
+    def _executed_sql(mock_cur: MagicMock) -> list[str]:
+        return [call.args[0] for call in mock_cur.execute.call_args_list]
+
+    @staticmethod
+    def _set_params(mock_cur: MagicMock, guc: str) -> object | None:
+        for call in mock_cur.execute.call_args_list:
+            if guc in call.args[0] and len(call.args) > 1:
+                return call.args[1][0]
+        return None
+
+    def test_ef_search_covers_the_requested_candidate_count(self) -> None:
+        from src.rag.retriever import _CANDIDATE_MULTIPLIER
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        top_k = 20
+        retriever.retrieve("revenue", top_k=top_k)
+
+        ef_search = self._set_params(mock_cur, "hnsw.ef_search")
+        assert ef_search is not None, "ef_search was never set"
+        assert ef_search >= top_k * _CANDIDATE_MULTIPLIER
+
+    def test_ef_search_never_drops_below_the_pgvector_default(self) -> None:
+        from src.rag.retriever import _MIN_EF_SEARCH
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        retriever.retrieve("revenue", top_k=1)
+
+        assert self._set_params(mock_cur, "hnsw.ef_search") == _MIN_EF_SEARCH
+
+    def test_ef_search_is_applied_before_the_vector_query(self) -> None:
+        """A SET issued after the search would not affect it."""
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        retriever.retrieve("revenue", top_k=5)
+
+        statements = self._executed_sql(mock_cur)
+        set_idx = next(i for i, s in enumerate(statements) if "hnsw.ef_search" in s)
+        scan_idx = next(i for i, s in enumerate(statements) if "<=>" in s)
+        assert set_idx < scan_idx
+
+    def test_filtered_search_enables_iterative_scan(self) -> None:
+        """HNSW filters after the scan, so a selective filter needs re-searching."""
+        from src.rag.retriever import _ITERATIVE_SCAN_MODE
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        retriever.retrieve("revenue", top_k=5, ticker_filter="AAPL")
+
+        assert self._set_params(mock_cur, "hnsw.iterative_scan") == _ITERATIVE_SCAN_MODE
+
+    def test_unfiltered_search_leaves_iterative_scan_off(self) -> None:
+        """Without a filter every neighbour survives, so plain HNSW is faster."""
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        retriever.retrieve("revenue", top_k=5)
+
+        assert all(
+            "hnsw.iterative_scan" not in s for s in self._executed_sql(mock_cur)
+        )
+
+    def test_retrieval_survives_pgvector_without_iterative_scan(self) -> None:
+        """pgvector < 0.8 has no such GUC; recall suffers but queries still run."""
+        import psycopg2
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        def _execute(sql: str, params: object = None) -> None:
+            if "hnsw.iterative_scan" in sql:
+                raise psycopg2.Error("unrecognized configuration parameter")
+
+        mock_cur.execute.side_effect = _execute
+
+        chunks, _, _ = retriever.retrieve("revenue", top_k=5, ticker_filter="AAPL")
+
+        assert len(chunks) == 1
+        assert retriever._iterative_scan_unsupported is True
+
+    def test_unsupported_iterative_scan_is_not_retried(self) -> None:
+        """The probe must not repeat on every single query."""
+        import psycopg2
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+        mock_cur.execute.side_effect = lambda sql, params=None: (
+            _ for _ in ()
+        ).throw(psycopg2.Error("nope")) if "hnsw.iterative_scan" in sql else None
+
+        retriever.retrieve("revenue", top_k=5, ticker_filter="AAPL")
+        first_attempts = sum(
+            1 for c in mock_cur.execute.call_args_list if "hnsw.iterative_scan" in c.args[0]
+        )
+        retriever.retrieve("revenue", top_k=5, ticker_filter="AAPL")
+        total_attempts = sum(
+            1 for c in mock_cur.execute.call_args_list if "hnsw.iterative_scan" in c.args[0]
+        )
+
+        assert first_attempts == 1
+        assert total_attempts == 1
+
+
+class TestThreadSafety:
+    """Retrieval runs in a thread pool, so the shared model and connection are
+    touched concurrently.
+
+    SentenceTransformer.encode() is not thread-safe for nomic-bert: the model
+    keeps its rotary-embedding tables as mutable state and resizes them to each
+    input's sequence length, so two overlapping encodes raise a tensor-size
+    mismatch mid-forward. hnsw.ef_search has the same class of problem at the
+    database level — it is session state on a shared connection.
+    """
+
+    @staticmethod
+    def _overlap_detector() -> tuple[MagicMock, list[int]]:
+        """Return a side_effect that records the max concurrent entry count."""
+        import threading
+
+        state = {"active": 0, "peak": 0}
+        guard = threading.Lock()
+        peak: list[int] = []
+
+        def _tracked(*_args: object, **_kwargs: object) -> np.ndarray:
+            with guard:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.02)  # widen the window for a race to show up
+            with guard:
+                state["active"] -= 1
+                peak.append(state["peak"])
+            return _unit(0)
+
+        return MagicMock(side_effect=_tracked), peak
+
+    def test_concurrent_embed_query_never_overlaps(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        retriever, _ = _make_retriever(_unit(0))
+        tracked, peak = self._overlap_detector()
+        retriever._model.encode = tracked
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(retriever.embed_query, [f"question {i}" for i in range(8)]))
+
+        assert max(peak) == 1, (
+            f"{max(peak)} concurrent encodes observed — the model forward pass "
+            "must be serialised or nomic-bert's cached rotary tables corrupt"
+        )
+
+    def test_concurrent_embed_query_returns_correct_results(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        retriever, _ = _make_retriever(_unit(0))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(retriever.embed_query, [f"question {i}" for i in range(8)])
+            )
+        assert all(len(r) == _DIM for r in results)
+
+    def test_concurrent_vector_search_never_overlaps(self) -> None:
+        """The ef_search SET and the query it tunes must apply as a unit."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        tracked, peak = self._overlap_detector()
+        mock_cur.execute = tracked
+        mock_cur.fetchall.return_value = [_row("chunk1", _unit(0))]
+
+        def _search(_i: int) -> object:
+            return retriever._vector_search([0.1] * _DIM, 20, [], [])
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(_search, range(6)))
+
+        assert max(peak) == 1
+
+    def test_reconnect_is_not_raced(self) -> None:
+        """Two threads seeing a closed connection must not both open one."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        retriever, _ = _make_retriever(_unit(0))
+        retriever._conn = None
+
+        connects: list[int] = []
+
+        def _connect() -> None:
+            time.sleep(0.01)
+            conn = MagicMock()
+            conn.closed = False
+            retriever._conn = conn
+            connects.append(1)
+
+        with (
+            patch.object(retriever, "connect", side_effect=_connect),
+            ThreadPoolExecutor(max_workers=8) as pool,
+        ):
+            list(pool.map(lambda _i: retriever._get_conn(), range(8)))
+
+        assert sum(connects) == 1
+
+
+class TestPing:
+    def test_ping_executes_a_trivial_query(self) -> None:
+        retriever, mock_cur = _make_retriever(_unit(0))
+        retriever.ping()
+        assert mock_cur.execute.call_args.args[0] == "SELECT 1"
+
+    def test_ping_propagates_connection_errors(self) -> None:
+        import psycopg2
+        import pytest
+
+        retriever, mock_cur = _make_retriever(_unit(0))
+        mock_cur.execute.side_effect = psycopg2.OperationalError("server closed")
+        with pytest.raises(psycopg2.OperationalError):
+            retriever.ping()
 
 
 class TestFuseRRF:

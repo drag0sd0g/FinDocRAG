@@ -33,7 +33,7 @@ curl -X POST http://localhost:8001/v1/ingest \
 }
 ```
 
-埋め込みワーカーが Kafka メッセージを受け取り、各ファイリングを約 512 トークンのウィンドウにチャンク分割し、`sentence-transformers/all-MiniLM-L6-v2` で埋め込みを生成して、ベクトルを pgvector に書き込みます。CPU 上では数分かかります。
+埋め込みワーカーが Kafka メッセージを受け取り、各ファイリングを約 512 トークンのウィンドウにチャンク分割し、`nomic-ai/nomic-embed-text-v1.5` で埋め込みを生成して、ベクトルを pgvector に書き込みます。CPU 上では数分かかります。
 
 ---
 

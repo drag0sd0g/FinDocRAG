@@ -9,7 +9,7 @@ Each run appends a new section below.
 
 ```bash
 # 1. Start the stack — choose one:
-make run          # includes Ollama (needs ~6 GB RAM + model download)
+make run          # includes containerised Ollama (downloads OLLAMA_MODEL on first start)
 make run-remote   # without Ollama; set LLM_BACKEND=claude or openai first
 
 # 2. Export credentials for the ragas judge (pick one; priority: Anthropic > OpenAI > Ollama)

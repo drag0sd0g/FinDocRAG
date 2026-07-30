@@ -35,7 +35,7 @@ from src.config import load_tickers, settings
 from src.db import IngestionDB
 from src.edgar_client import EdgarClient
 from src.facts import extract_annual_facts
-from src.kafka_producer import FilingProducer
+from src.kafka_producer import FilingProducer, PublishOutcome
 from src.metrics import FILINGS_FETCHED_TOTAL
 
 # ── Structured logging (TDD: Section 8.3) ───────────────────────
@@ -90,6 +90,9 @@ class IngestResponse(BaseModel):
     tickers_processed: list[str]
     filings_published: int
     filings_skipped: int
+    # Filings Kafka never acknowledged. Deliberately not recorded as ingested,
+    # so a subsequent /v1/ingest call retries them.
+    filings_failed: int
     facts_stored: int
     errors: list[str]
 
@@ -193,7 +196,16 @@ def _publish_single_filing(
     db: Any,
     producer: Any,
 ) -> str:
-    """Attempt to publish one filing.  Returns 'published', 'skipped', or raises."""
+    """Attempt to publish one filing.
+
+    Returns 'published', 'skipped' (already ingested, or too large to publish),
+    or 'failed' (Kafka did not acknowledge the message).
+
+    ``ingestion_log`` is only written after the broker confirms delivery.
+    Writing it earlier would permanently mark the accession as ingested —
+    ``is_already_ingested`` would skip it on every future run — even though the
+    filing never reached the topic and no chunks will ever be produced.
+    """
     if db.is_already_ingested(filing.accession_number):
         logger.info(
             "filing_skipped_duplicate",
@@ -209,8 +221,22 @@ def _publish_single_filing(
         filing_date=filing.filing_date,
     )
     t_publish = time.perf_counter()
-    if not producer.publish_filing(filing):
+    outcome = producer.publish_filing(filing)
+
+    if outcome is PublishOutcome.TOO_LARGE:
         return "skipped"
+
+    if outcome is not PublishOutcome.DELIVERED:
+        # Left unrecorded on purpose: the next ingest run retries this filing.
+        logger.error(
+            "filing_publish_failed",
+            ticker=symbol,
+            accession=filing.accession_number,
+            outcome=str(outcome),
+            elapsed_ms=round((time.perf_counter() - t_publish) * 1000, 1),
+        )
+        return "failed"
+
     db.record_ingestion(filing)
     logger.info(
         "filing_published",
@@ -263,6 +289,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
 
     filings_published = 0
     filings_skipped = 0
+    filings_failed = 0
     facts_stored = 0
     errors: list[str] = []
     tickers_processed: list[str] = []
@@ -289,6 +316,13 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
                     if result == "published":
                         filings_published += 1
                         FILINGS_FETCHED_TOTAL.labels(ticker=symbol, status="success").inc()
+                    elif result == "failed":
+                        filings_failed += 1
+                        errors.append(
+                            f"Kafka delivery failed for {symbol} "
+                            f"{filing.accession_number}; will retry on next run"
+                        )
+                        FILINGS_FETCHED_TOTAL.labels(ticker=symbol, status="error").inc()
                     else:
                         filings_skipped += 1
                         FILINGS_FETCHED_TOTAL.labels(ticker=symbol, status="skipped").inc()
@@ -304,6 +338,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
                     ticker=symbol,
                     filings_published=filings_published,
                     filings_skipped=filings_skipped,
+                    filings_failed=filings_failed,
                     elapsed_ms=round((time.perf_counter() - t_ticker) * 1000, 1),
                 )
 
@@ -325,6 +360,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
         tickers=tickers_processed,
         filings_published=filings_published,
         filings_skipped=filings_skipped,
+        filings_failed=filings_failed,
         facts_stored=facts_stored,
         errors=len(errors),
         elapsed_ms=round((time.perf_counter() - t_request) * 1000, 1),
@@ -335,6 +371,7 @@ async def ingest(body: IngestRequest | None = None) -> IngestResponse:
         tickers_processed=tickers_processed,
         filings_published=filings_published,
         filings_skipped=filings_skipped,
+        filings_failed=filings_failed,
         facts_stored=facts_stored,
         errors=errors,
     )

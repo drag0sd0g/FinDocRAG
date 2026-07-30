@@ -14,6 +14,7 @@ data:
   LLM_BACKEND: {{ .Values.queryApi.llmBackend | quote }}
   OLLAMA_URL: http://{{ .Release.Name }}-ollama:11434
   OLLAMA_MODEL: {{ .Values.ollama.model | quote }}
+  OLLAMA_NUM_CTX: {{ .Values.queryApi.ollamaNumCtx | quote }}
   EDGAR_USER_AGENT: {{ .Values.ingestion.edgarUserAgent | quote }}
   EDGAR_RATE_LIMIT_RPS: {{ .Values.ingestion.edgarRateLimitRps | quote }}
   LOG_LEVEL: {{ .Values.ingestion.logLevel | quote }}

@@ -9,7 +9,7 @@
 
 ```bash
 # 1. スタックを起動する — どちらか一方を選択:
-make run          # Ollama を含む（約 6 GB の RAM とモデルのダウンロードが必要）
+make run          # コンテナ化された Ollama を含む（初回起動時に OLLAMA_MODEL をダウンロード）
 make run-remote   # Ollama なし; 事前に LLM_BACKEND=claude または openai を設定すること
 
 # 2. ragas ジャッジ用の認証情報をエクスポートする（いずれか一つ; 優先順位: Anthropic > OpenAI > Ollama）

@@ -117,6 +117,56 @@ class TestMainEmptyCorpus:
         dd.main()
 
 
+# ── main() — lookback window SQL ─────────────────────────────────
+
+class TestLookbackWindowQuery:
+    """The recent-window query must compare two timestamptz values.
+
+    Subtracting the interval from a naive `NOW() AT TIME ZONE 'UTC'` makes
+    Postgres re-interpret the result in the server's local zone, shifting the
+    window by that offset whenever the server is not on UTC.
+    """
+
+    def _run_and_capture_sql(self) -> list[tuple[str, tuple[object, ...] | None]]:
+        executed: list[tuple[str, tuple[object, ...] | None]] = []
+        results = iter([(np.array([1.0, 0.0]),), (np.array([1.0, 0.0]),)])
+
+        mock_cur = MagicMock()
+        mock_cur.__enter__ = MagicMock(return_value=mock_cur)
+        mock_cur.__exit__ = MagicMock(return_value=False)
+        mock_cur.fetchone.side_effect = lambda: next(results)
+        mock_cur.execute.side_effect = lambda sql, params=None: executed.append(
+            (sql, params)
+        )
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch("src.drift_detector.psycopg2.connect", return_value=mock_conn),
+            patch("src.drift_detector.register_vector"),
+            patch.object(dd, "PUSHGATEWAY_URL", None),
+        ):
+            dd.main()
+        return executed
+
+    def test_recent_window_compares_against_timestamptz(self) -> None:
+        recent_sql = self._run_and_capture_sql()[1][0]
+        assert "NOW()" in recent_sql
+        assert "AT TIME ZONE" not in recent_sql
+
+    def test_lookback_days_is_a_bound_parameter(self) -> None:
+        """The window must not be interpolated inside a quoted literal.
+
+        `INTERVAL '%s days'` puts the placeholder inside a string, which
+        psycopg2 does not support.
+        """
+        recent_sql, params = self._run_and_capture_sql()[1]
+        assert "make_interval" in recent_sql
+        assert "INTERVAL '" not in recent_sql
+        assert params == (dd.DRIFT_LOOKBACK_DAYS,)
+
+
 # ── main() — normal run (no alert) ───────────────────────────────
 
 class TestMainNormalRun:

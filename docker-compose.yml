@@ -2,6 +2,14 @@
 # FinDocDRAG — Full Local Stack
 # Usage: docker compose up
 # See: docs/technical-design-document.md Section 10.2
+#
+# CPU and memory limits below are environment variables with conservative
+# defaults so the stack starts on a modest machine. Raise them in .env to
+# suit the host — see the "Performance tuning" table in README.md.
+#
+# Note: a limit larger than the container runtime's own memory allowance is
+# silently ignored (Docker Desktop / OrbStack run a fixed-size Linux VM), so
+# check `docker info` before setting large values here.
 # ============================================================
 
 services:
@@ -21,18 +29,20 @@ services:
     command:
       - postgres
       - -c
-      - shared_buffers=2GB
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-2GB}
       - -c
-      - work_mem=256MB
+      - work_mem=${POSTGRES_WORK_MEM:-256MB}
       - -c
-      - maintenance_work_mem=1GB
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
       - -c
-      - effective_cache_size=4GB
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-4GB}
+      - -c
+      - max_parallel_workers_per_gather=${POSTGRES_PARALLEL_WORKERS_PER_GATHER:-2}
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 8G
+          cpus: "${POSTGRES_CPUS:-4.0}"
+          memory: ${POSTGRES_MEMORY:-8G}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U findocdrag -d findocdrag"]
       interval: 5s
@@ -95,8 +105,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 4G
+          cpus: "${KAFKA_CPUS:-2.0}"
+          memory: ${KAFKA_MEMORY:-4G}
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
@@ -132,6 +142,12 @@ services:
   # Only started when the "local-llm" profile is active:
   #   docker compose --profile local-llm up -d
   # Omit the profile flag (or set LLM_BACKEND=claude/openai) to skip Ollama entirely.
+  #
+  # IMPORTANT: on macOS and Windows this container has no access to the host
+  # GPU — Docker runs it inside a Linux VM — so inference is CPU-only and slow
+  # no matter how much CPU/memory it is given. For GPU-accelerated local
+  # inference, run Ollama natively on the host, start the stack WITHOUT this
+  # profile, and set OLLAMA_URL=http://host.docker.internal:11434.
   ollama:
     profiles: [local-llm]
     image: ollama/ollama:latest
@@ -139,10 +155,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8.0"
-          memory: 16G
+          cpus: "${OLLAMA_CPUS:-8.0}"
+          # Must stay within the container runtime's VM allowance or Docker
+          # silently drops the limit. Size it to the model plus its KV cache.
+          memory: ${OLLAMA_MEMORY:-8G}
+    # Not published by default: binding the host's 11434 shadows a natively
+    # installed Ollama on that port (the container binds all interfaces,
+    # including IPv6, so "localhost:11434" resolves to the container). Set
+    # OLLAMA_HOST_PORT to expose it deliberately.
     ports:
-      - "11434:11434"
+      - "${OLLAMA_HOST_PORT:-127.0.0.1:11435}:11434"
     volumes:
       - ollama_models:/root/.ollama
     healthcheck:
@@ -177,8 +199,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 2G
+          cpus: "${INGESTION_CPUS:-2.0}"
+          memory: ${INGESTION_MEMORY:-2G}
     depends_on:
       db-migrate:
         condition: service_completed_successfully
@@ -213,8 +235,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "12.0"
-          memory: 16G
+          cpus: "${EMBEDDING_WORKER_CPUS:-12.0}"
+          # Keep within the runtime's VM allowance; a larger value is ignored.
+          memory: ${EMBEDDING_WORKER_MEMORY:-6G}
     depends_on:
       db-migrate:
         condition: service_completed_successfully
@@ -248,11 +271,17 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4.0"
-          memory: 4G
+          # Retrieval (embedding + pgvector) runs in a thread pool, so this
+          # caps how much concurrent query work the service can actually do.
+          cpus: "${QUERY_API_CPUS:-4.0}"
+          memory: ${QUERY_API_MEMORY:-4G}
     depends_on:
       db-migrate:
         condition: service_completed_successfully
+    # Lets OLLAMA_URL reach a host-native Ollama. Docker Desktop and OrbStack
+    # resolve host.docker.internal already; this adds it on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -260,8 +289,13 @@ services:
       POSTGRES_USER: findocdrag
       POSTGRES_PASSWORD: changeme
       LLM_BACKEND: "${LLM_BACKEND:-ollama}"
-      OLLAMA_URL: "http://ollama:11434"
+      # Defaults to the containerised Ollama on the compose network. Point this
+      # at http://host.docker.internal:11434 to use a host-native Ollama (the
+      # only way to get GPU acceleration on macOS/Windows); the native server
+      # must then listen on all interfaces, e.g. OLLAMA_HOST=0.0.0.0:11434.
+      OLLAMA_URL: "${OLLAMA_URL:-http://ollama:11434}"
       OLLAMA_MODEL: "${OLLAMA_MODEL:-mistral:7b}"
+      OLLAMA_NUM_CTX: "${OLLAMA_NUM_CTX:-8192}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_MODEL: "${CLAUDE_MODEL:-claude-opus-4-6}"

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from confluent_kafka import KafkaError, Producer
+from confluent_kafka import KafkaError, KafkaException, Producer
 
 from src.config import settings
 from src.metrics import FILING_SIZE_BYTES, KAFKA_PUBLISH_TOTAL
@@ -27,6 +28,18 @@ logger = structlog.get_logger()
 TOPIC_FILINGS_RAW = "filings.raw"
 
 _KAFKA_MAX_MESSAGE_BYTES = 157_286_400  # 150 MB — must match broker KAFKA_MESSAGE_MAX_BYTES
+
+# How long to wait for the broker to acknowledge one filing before treating it
+# as undelivered.  Generous because acks=all on a multi-MB message is slow.
+_DELIVERY_TIMEOUT_SECONDS = 120.0
+
+
+class PublishOutcome(StrEnum):
+    """Result of attempting to publish one filing."""
+
+    DELIVERED = "delivered"       # broker acknowledged the message
+    TOO_LARGE = "too_large"       # payload over MAX_RAW_BYTES, never produced
+    FAILED = "failed"             # produce errored, was rejected, or timed out
 
 
 def _delivery_callback(err: KafkaError | None, msg: Any) -> None:
@@ -73,11 +86,20 @@ class FilingProducer:
             }
         )
 
-    def publish_filing(self, filing: Filing) -> bool:
-        """Serialize a Filing and publish it to Kafka (FR-3).
+    def publish_filing(
+        self,
+        filing: Filing,
+        *,
+        timeout: float = _DELIVERY_TIMEOUT_SECONDS,
+    ) -> PublishOutcome:
+        """Serialize a Filing and publish it to Kafka, waiting for the ack (FR-3).
 
-        Returns True if the message was produced, False if it was skipped
-        because the raw payload exceeded MAX_RAW_BYTES.
+        ``produce()`` only enqueues into librdkafka's buffer; delivery happens
+        later and can still fail.  The caller records the filing in
+        ``ingestion_log``, which permanently suppresses re-ingestion of that
+        accession number, so returning before the broker has acknowledged the
+        message risks losing a filing with no way to notice.  This method
+        therefore blocks until delivery is confirmed and reports the outcome.
         """
         message = {
             "accession_number": filing.accession_number,
@@ -103,16 +125,57 @@ class FilingProducer:
                 raw_mb=round(raw_bytes / 1024 / 1024, 1),
                 limit_mb=round(self.MAX_RAW_BYTES / 1024 / 1024, 1),
             )
-            return False
+            return PublishOutcome.TOO_LARGE
 
-        self._producer.produce(
-            topic=TOPIC_FILINGS_RAW,
-            key=filing.accession_number,
-            value=payload,
-            callback=_delivery_callback,
-        )
-        self._producer.poll(0)  # Trigger any pending delivery callbacks
-        return True
+        # Captured by the per-message callback below; non-empty means the
+        # broker rejected this specific message.
+        delivery_errors: list[str] = []
+
+        def _on_delivery(err: KafkaError | None, msg: Any) -> None:
+            _delivery_callback(err, msg)
+            if err is not None:
+                delivery_errors.append(str(err))
+
+        try:
+            self._producer.produce(
+                topic=TOPIC_FILINGS_RAW,
+                key=filing.accession_number,
+                value=payload,
+                callback=_on_delivery,
+            )
+        except (BufferError, KafkaException) as exc:
+            KAFKA_PUBLISH_TOTAL.labels(topic=TOPIC_FILINGS_RAW, status="error").inc()
+            logger.error(
+                "kafka_produce_failed",
+                ticker=filing.ticker,
+                accession=filing.accession_number,
+                error=str(exc),
+            )
+            return PublishOutcome.FAILED
+
+        # Block until this message is acknowledged. flush() returns the number
+        # of messages still queued, so a non-zero result means we timed out.
+        remaining = self._producer.flush(timeout)
+        if remaining:
+            logger.error(
+                "kafka_delivery_timeout",
+                ticker=filing.ticker,
+                accession=filing.accession_number,
+                timeout_seconds=timeout,
+                still_queued=remaining,
+            )
+            return PublishOutcome.FAILED
+
+        if delivery_errors:
+            logger.error(
+                "kafka_delivery_rejected",
+                ticker=filing.ticker,
+                accession=filing.accession_number,
+                error=delivery_errors[0],
+            )
+            return PublishOutcome.FAILED
+
+        return PublishOutcome.DELIVERED
 
     def flush(self, timeout: float = 10.0) -> int:
         """Wait for all in-flight messages to be delivered.
