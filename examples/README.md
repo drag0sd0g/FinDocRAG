@@ -33,7 +33,7 @@ curl -X POST http://localhost:8001/v1/ingest \
 }
 ```
 
-The embedding worker picks up the Kafka messages, chunks each filing into ~512-token windows, embeds them with `sentence-transformers/all-MiniLM-L6-v2`, and writes the vectors to pgvector. This takes a few minutes on CPU.
+The embedding worker picks up the Kafka messages, chunks each filing into ~512-token windows, embeds them with `nomic-ai/nomic-embed-text-v1.5`, and writes the vectors to pgvector. This takes a few minutes on CPU.
 
 ---
 

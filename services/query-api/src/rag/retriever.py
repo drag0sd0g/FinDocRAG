@@ -25,6 +25,7 @@ References:
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,19 @@ _MAX_CANDIDATES = 100
 # RRF constant from Cormack et al. (2009); dampens the weight of top ranks
 # so one leg cannot dominate the fusion.
 _RRF_K = 60
+
+# pgvector explores `hnsw.ef_search` candidates per HNSW search and defaults to
+# 40.  Asking for more rows than that (candidate_k reaches 100 here) silently
+# returns fewer and lower-quality neighbours, starving RRF and MMR of material.
+# Keeping ef_search at or above the requested LIMIT is pgvector's documented
+# guidance for recall.
+_MIN_EF_SEARCH = 40
+
+# With a WHERE clause, HNSW filters *after* the index scan, so a selective
+# ticker/date filter can leave almost nothing behind.  pgvector 0.8's iterative
+# scan re-searches until enough rows survive the filter.  "relaxed_order" keeps
+# recall high at a small ordering cost, which RRF re-ranks away anyway.
+_ITERATIVE_SCAN_MODE = "relaxed_order"
 
 # Columns shared by both retrieval legs (score is appended per leg).
 _CHUNK_COLUMNS = "chunk_id, ticker, filing_date, section_name, chunk_text, embedding"
@@ -166,6 +180,27 @@ class Retriever:
         self._dsn = dsn
         self._conn: psycopg2.extensions.connection | None = None
         self._query_prefix = query_prefix
+        # Retrieval runs in a worker thread (see RAGGenerator), so the lazy
+        # reconnect below must not race: two threads both observing a closed
+        # connection would otherwise open two and leak one.
+        self._conn_lock = threading.Lock()
+        # SentenceTransformer.encode() is NOT thread-safe for this model:
+        # nomic-bert keeps its rotary-embedding tables (_cos_cached/_sin_cached)
+        # as mutable state on the shared module and resizes them to each input's
+        # sequence length. Two concurrent encodes with different lengths corrupt
+        # each other mid-forward, raising a tensor-size mismatch. Serialising
+        # the forward pass costs little — torch already parallelises internally
+        # across cores, so concurrent encodes mostly contend for the same CPU —
+        # and the event loop stays free either way, which is the point.
+        self._encode_lock = threading.Lock()
+        # hnsw.ef_search is *session* state on a connection shared by all worker
+        # threads, so the SET and the SELECT that depends on it must be applied
+        # as a unit; otherwise one thread's tuning silently applies to another
+        # thread's query.
+        self._search_lock = threading.Lock()
+        # Set once, the first time pgvector rejects the iterative-scan GUC
+        # (pgvector < 0.8), so the warning is logged once and not per query.
+        self._iterative_scan_unsupported = False
         logger.info("retriever_loading_model", model=model_name)
         # trust_remote_code: nomic ships a custom BERT (nomic-bert-2048); the
         # flag is ignored by standard sentence-transformers models.
@@ -185,11 +220,22 @@ class Retriever:
             self._conn = None
 
     def _get_conn(self) -> psycopg2.extensions.connection:
-        if self._conn is None or self._conn.closed:
-            self.connect()
-        if self._conn is None:
-            raise RuntimeError("Failed to establish database connection")
-        return self._conn
+        # psycopg2 connections are safe to share between threads (the driver
+        # serialises libpq access); only the reconnect needs guarding.
+        with self._conn_lock:
+            if self._conn is None or self._conn.closed:
+                self.connect()
+            if self._conn is None:
+                raise RuntimeError("Failed to establish database connection")
+            return self._conn
+
+    def ping(self) -> None:
+        """Execute a trivial query to confirm the database is reachable.
+
+        Raises whatever psycopg2 raises when the connection is unusable.
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT 1")
 
     @contextlib.contextmanager
     def _cursor(self) -> Generator[psycopg2.extensions.cursor, None, None]:
@@ -206,11 +252,12 @@ class Retriever:
         The ``search_query:`` task prefix mirrors the ``search_document:``
         prefix applied to chunks at ingestion time (asymmetric retrieval).
         """
-        embedding = self._model.encode(
-            f"{self._query_prefix}{question}",
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with self._encode_lock:
+            embedding = self._model.encode(
+                f"{self._query_prefix}{question}",
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         return embedding.tolist()
 
     def verify_embedding_model_consistency(self) -> None:
@@ -265,6 +312,33 @@ class Retriever:
             params.append(filing_date_to)
         return clauses, params
 
+    def _apply_hnsw_tuning(
+        self,
+        cur: psycopg2.extensions.cursor,
+        candidate_k: int,
+        *,
+        filtered: bool,
+    ) -> None:
+        """Raise HNSW search effort to match how many candidates we ask for.
+
+        Without this, pgvector's default ef_search of 40 caps the vector leg
+        well below candidate_k and quietly degrades recall.  The connection
+        runs in autocommit mode, so SET LOCAL would be reverted immediately —
+        these are session-level SETs, which is what we want on a long-lived
+        connection.
+        """
+        cur.execute("SET hnsw.ef_search = %s", (max(candidate_k, _MIN_EF_SEARCH),))
+
+        if not filtered or self._iterative_scan_unsupported:
+            return
+        try:
+            cur.execute("SET hnsw.iterative_scan = %s", (_ITERATIVE_SCAN_MODE,))
+        except psycopg2.Error as exc:
+            # pgvector < 0.8 has no such GUC. Filtered recall is worse without
+            # it, but the query itself is still correct, so carry on.
+            self._iterative_scan_unsupported = True
+            logger.warning("hnsw_iterative_scan_unsupported", error=str(exc))
+
     def _vector_search(
         self,
         query_embedding: list[float],
@@ -283,7 +357,10 @@ class Retriever:
             LIMIT %s
         """
         params = [query_embedding, *filter_params, query_embedding, candidate_k]
-        with self._cursor() as cur:
+        # Lock spans the tuning SET and the query it applies to — see
+        # _search_lock in __init__.
+        with self._search_lock, self._cursor() as cur:
+            self._apply_hnsw_tuning(cur, candidate_k, filtered=bool(filter_clauses))
             cur.execute(sql, params)
             rows: list[tuple[Any, ...]] = cur.fetchall()
         return rows

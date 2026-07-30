@@ -198,11 +198,11 @@ Answer:
 | ID    | Requirement                                                                                                                                                             |
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | NFR-1 | Vector similarity search (retrieval only, excluding LLM generation) SHALL complete within 200ms at p99 for a corpus of up to 500,000 chunks.                            |
-| NFR-2 | End-to-end query latency (retrieval + LLM generation) SHALL complete within 10 seconds at p95 when using Ollama with `mistral:7b` on a machine with at least 16 GB RAM. |
+| NFR-2 | End-to-end query latency (retrieval + LLM generation) SHALL complete within 10 seconds at p95 when the LLM backend is GPU-accelerated or hosted. CPU-only local inference is out of scope for this target: its latency is set by the chosen model and host hardware, not by this system. |
 | NFR-3 | The embedding worker SHALL process and store at least 50 chunks per second on a single worker instance.                                                                 |
 | NFR-4 | The ingestion service SHALL fetch and publish at least 10 filings per minute from SEC EDGAR, respecting the SEC's rate limit of 10 requests per second.                 |
 
-> **Note:** NFR-1 through NFR-4 are design targets sized for the intended deployment profile (≥16 GB RAM, CPU-only embedding). No benchmark measurements have been taken yet. Validation against actual measurements is planned for the first full evaluation run (expected April 2026 once evaluation hardware is available). Numbers may be revised once real data is collected.
+> **Note:** NFR-1 through NFR-4 are design targets, not measured results, and they deliberately do not pin a hardware profile — CPU, memory, and batch sizes are configurable per deployment (see Section 10.2). Validation against actual measurements is planned for the first full evaluation run. Numbers may be revised once real data is collected.
 
 ### 4.2 Capacity
 

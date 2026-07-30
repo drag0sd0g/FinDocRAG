@@ -17,6 +17,7 @@ import pytest
 
 from src.config import Settings, load_tickers
 from src.edgar_client import EdgarClient, Filing
+from src.kafka_producer import PublishOutcome
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -609,6 +610,49 @@ class TestConfig:
 # ── Kafka Producer ───────────────────────────────────────────────
 
 
+def _delivery_test_filing() -> Filing:
+    return Filing(
+        accession_number="0001-24-000001",
+        ticker="AAPL",
+        company_name="Apple Inc.",
+        filing_date="2024-11-01",
+        filing_type="10-K",
+        source_url="https://sec.gov/...",
+        raw_text="Item 1. Business...",
+    )
+
+
+def _make_acking_producer_mock(delivery_error: str | None = None) -> MagicMock:
+    """Mock Producer whose flush() fires the pending delivery callback.
+
+    Mirrors librdkafka: produce() only enqueues, and the callback registered
+    with it runs later — during flush() — carrying the delivery result.
+    """
+    instance = MagicMock()
+    pending: list[Any] = []
+
+    def _produce(**kwargs: Any) -> None:
+        pending.append(kwargs["callback"])
+
+    def _flush(_timeout: float = 0.0) -> int:
+        msg = MagicMock()
+        msg.topic.return_value = "filings.raw"
+        msg.partition.return_value = 0
+        msg.offset.return_value = 1
+        err = None
+        if delivery_error is not None:
+            err = MagicMock()
+            err.__str__ = lambda _self: delivery_error  # type: ignore[assignment]
+        for callback in pending:
+            callback(err, msg)
+        pending.clear()
+        return 0  # nothing left queued
+
+    instance.produce.side_effect = _produce
+    instance.flush.side_effect = _flush
+    return instance
+
+
 class TestKafkaProducer:
     """Tests for kafka_producer.py (serialisation logic)."""
 
@@ -646,6 +690,78 @@ class TestKafkaProducer:
             assert msg["raw_text"] == "Item 1. Business..."
             assert msg["source_url"] == "https://sec.gov/..."
             assert msg["accession_number"] == "0001-24-000001"
+
+    def test_publish_filing_returns_delivered_once_broker_acks(self) -> None:
+        """A clean flush with no callback error means the broker took the message."""
+        from src.kafka_producer import FilingProducer
+
+        with patch("src.kafka_producer.Producer") as mock_producer:
+            mock_instance = _make_acking_producer_mock()
+            mock_producer.return_value = mock_instance
+
+            producer = FilingProducer(bootstrap_servers="localhost:9092")
+            outcome = producer.publish_filing(_delivery_test_filing())
+
+            assert outcome is PublishOutcome.DELIVERED
+            # The ack must be waited for, not left in the background buffer.
+            mock_instance.flush.assert_called_once()
+
+    def test_publish_filing_returns_failed_when_broker_rejects(self) -> None:
+        """A delivery callback carrying an error must not be reported as success."""
+        from src.kafka_producer import FilingProducer
+
+        with patch("src.kafka_producer.Producer") as mock_producer:
+            mock_instance = _make_acking_producer_mock(delivery_error="Broker unavailable")
+            mock_producer.return_value = mock_instance
+
+            producer = FilingProducer(bootstrap_servers="localhost:9092")
+            outcome = producer.publish_filing(_delivery_test_filing())
+
+            assert outcome is PublishOutcome.FAILED
+
+    def test_publish_filing_returns_failed_when_flush_times_out(self) -> None:
+        """Messages still queued after flush() are undelivered, not delivered."""
+        from src.kafka_producer import FilingProducer
+
+        with patch("src.kafka_producer.Producer") as mock_producer:
+            mock_instance = MagicMock()
+            mock_instance.flush.return_value = 1  # one message still queued
+            mock_producer.return_value = mock_instance
+
+            producer = FilingProducer(bootstrap_servers="localhost:9092")
+            outcome = producer.publish_filing(_delivery_test_filing(), timeout=0.1)
+
+            assert outcome is PublishOutcome.FAILED
+
+    def test_publish_filing_returns_failed_when_produce_raises(self) -> None:
+        """A full local queue surfaces as a failure rather than an exception."""
+        from src.kafka_producer import FilingProducer
+
+        with patch("src.kafka_producer.Producer") as mock_producer:
+            mock_instance = MagicMock()
+            mock_instance.produce.side_effect = BufferError("Local queue full")
+            mock_producer.return_value = mock_instance
+
+            producer = FilingProducer(bootstrap_servers="localhost:9092")
+            outcome = producer.publish_filing(_delivery_test_filing())
+
+            assert outcome is PublishOutcome.FAILED
+
+    def test_publish_filing_returns_too_large_without_producing(self) -> None:
+        """Oversize filings are rejected before hitting the broker."""
+        from src.kafka_producer import FilingProducer
+
+        with patch("src.kafka_producer.Producer") as mock_producer:
+            mock_instance = _make_acking_producer_mock()
+            mock_producer.return_value = mock_instance
+
+            producer = FilingProducer(bootstrap_servers="localhost:9092")
+            producer.MAX_RAW_BYTES = 10  # smaller than any serialised filing
+
+            outcome = producer.publish_filing(_delivery_test_filing())
+
+            assert outcome is PublishOutcome.TOO_LARGE
+            mock_instance.produce.assert_not_called()
 
     def test_flush_delegates_to_producer(self) -> None:
         from src.kafka_producer import FilingProducer
@@ -849,7 +965,7 @@ class TestFastAPIApp:
         mock_kafka = MagicMock()
         mock_db = MagicMock()
 
-        mock_kafka.publish_filing = MagicMock()
+        mock_kafka.publish_filing = MagicMock(return_value=PublishOutcome.DELIVERED)
         mock_kafka.flush = MagicMock()
         mock_db.is_already_ingested.return_value = False
 
@@ -869,6 +985,7 @@ class TestFastAPIApp:
             assert data["tickers_processed"] == ["AAPL"]
             assert data["filings_published"] == 1
             assert data["filings_skipped"] == 0
+            assert data["filings_failed"] == 0
             assert data["facts_stored"] == 0
             assert data["errors"] == []
             mock_kafka.publish_filing.assert_called_once_with(filing)
@@ -1048,6 +1165,95 @@ class TestFastAPIApp:
             main_module._kafka_producer = original_kafka
             main_module._db = original_db
 
+    def test_ingest_does_not_record_filing_kafka_never_acked(self) -> None:
+        """A filing Kafka never acknowledged must stay eligible for re-ingestion.
+
+        Recording it in ingestion_log would make is_already_ingested() skip it
+        on every future run, losing the filing permanently even though no
+        chunks were ever produced for it.
+        """
+        from fastapi.testclient import TestClient
+
+        import src.main as main_module
+
+        filing = _delivery_test_filing()
+
+        mock_edgar = _make_edgar_mock(filings=[filing])
+        mock_kafka = MagicMock()
+        mock_kafka.publish_filing = MagicMock(return_value=PublishOutcome.FAILED)
+        mock_kafka.flush = MagicMock()
+        mock_db = MagicMock()
+        mock_db.is_already_ingested.return_value = False
+
+        original_edgar = main_module._edgar_client
+        original_kafka = main_module._kafka_producer
+        original_db = main_module._db
+        main_module._edgar_client = mock_edgar
+        main_module._kafka_producer = mock_kafka
+        main_module._db = mock_db
+
+        try:
+            client = TestClient(app=main_module.app, raise_server_exceptions=False)
+            response = client.post("/v1/ingest", json={"tickers": ["AAPL"]})
+            assert response.status_code == 200
+            data = response.json()
+
+            # The filing counts as failed, never as published or merely skipped.
+            assert data["filings_failed"] == 1
+            assert data["filings_published"] == 0
+            assert data["filings_skipped"] == 0
+            # The critical assertion: nothing was written to ingestion_log.
+            mock_db.record_ingestion.assert_not_called()
+            # And the failure is visible to the caller, not swallowed.
+            assert len(data["errors"]) == 1
+            assert filing.accession_number in data["errors"][0]
+        finally:
+            main_module._edgar_client = original_edgar
+            main_module._kafka_producer = original_kafka
+            main_module._db = original_db
+
+    def test_ingest_records_filing_only_after_delivery_ack(self) -> None:
+        """ingestion_log is written only once the broker has confirmed delivery."""
+        from fastapi.testclient import TestClient
+
+        import src.main as main_module
+
+        filing = _delivery_test_filing()
+        call_order: list[str] = []
+
+        mock_edgar = _make_edgar_mock(filings=[filing])
+        mock_kafka = MagicMock()
+        mock_db = MagicMock()
+        mock_db.is_already_ingested.return_value = False
+
+        def _publish(_filing: Filing) -> PublishOutcome:
+            call_order.append("publish")
+            return PublishOutcome.DELIVERED
+
+        mock_kafka.publish_filing = MagicMock(side_effect=_publish)
+        mock_kafka.flush = MagicMock()
+        mock_db.record_ingestion = MagicMock(
+            side_effect=lambda _f: call_order.append("record")
+        )
+
+        original_edgar = main_module._edgar_client
+        original_kafka = main_module._kafka_producer
+        original_db = main_module._db
+        main_module._edgar_client = mock_edgar
+        main_module._kafka_producer = mock_kafka
+        main_module._db = mock_db
+
+        try:
+            client = TestClient(app=main_module.app, raise_server_exceptions=False)
+            response = client.post("/v1/ingest", json={"tickers": ["AAPL"]})
+            assert response.status_code == 200
+            assert response.json()["filings_published"] == 1
+            assert call_order == ["publish", "record"]
+        finally:
+            main_module._edgar_client = original_edgar
+            main_module._kafka_producer = original_kafka
+            main_module._db = original_db
+
     def test_ingest_mixed_new_and_duplicate_filings(self) -> None:
         """POST /v1/ingest publishes new filings and skips duplicates in the same run."""
         from fastapi.testclient import TestClient
@@ -1075,6 +1281,7 @@ class TestFastAPIApp:
 
         mock_edgar = _make_edgar_mock(filings=[new_filing, dup_filing])
         mock_kafka = MagicMock()
+        mock_kafka.publish_filing = MagicMock(return_value=PublishOutcome.DELIVERED)
         mock_kafka.flush = MagicMock()
         mock_db = MagicMock()
         # new_filing is new, dup_filing is already ingested

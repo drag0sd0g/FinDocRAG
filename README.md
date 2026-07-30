@@ -30,7 +30,9 @@ API Client  <-->  Query API  <-->  Ollama / OpenAI / Claude              |
 - Python 3.12+ (for local development and running tests outside of Docker)
 - GNU Make (optional, for convenience targets)
 
-**Hardware (Ollama / local LLM path only):** `make run` pulls `mistral:7b` (~4 GB download) and requires at least **8 GB of free RAM** at runtime (model weights + Docker overhead). On machines with less RAM the Ollama container will be OOM-killed. The remote-LLM path (`make run-remote` with `LLM_BACKEND=claude` or `openai`) has no GPU or RAM requirements beyond the base stack (~2 GB).
+**Hardware:** The stack sizes itself to the machine it runs on — container CPU and memory limits, the embedding batch size, and the Ollama context window are all environment variables (see [Configuration](#configuration)), so scale them to the hardware you have. Requirements depend almost entirely on which LLM backend you choose: `make run-remote` with `LLM_BACKEND=claude` or `openai` performs no local inference at all, while the local-LLM path is bounded by the model you select.
+
+One caveat worth knowing before benchmarking locally: **containerised Ollama on macOS and Windows runs on CPU only**, because Docker's Linux VM cannot reach the host GPU. For substantially faster local generation, run Ollama natively on the host and point `OLLAMA_URL` at it — see [LLM Backends](#llm-backends).
 
 ## Quick Start
 
@@ -64,7 +66,7 @@ make run-remote
 
 On the first run this will pull container images, build the three services, and run database migrations. The schema is applied automatically from `db/migrations/001_initial_schema.sql` (creates the `pgvector` extension, `ingestion_log` and `document_chunks` tables, and the HNSW vector index). To run migrations manually at any time: `make migrate`.
 
-If using Ollama (`make run`), the `mistral:7b` model (~4 GB) is downloaded automatically on first start. Subsequent starts reuse cached layers and volumes.
+If using Ollama (`make run`), the model named by `OLLAMA_MODEL` is downloaded automatically on first start. Subsequent starts reuse cached layers and volumes.
 
 4. Verify the services are running:
 
@@ -350,7 +352,20 @@ All configuration is driven by environment variables. See `.env.example` for the
 | `OPENAI_MODEL`      | `gpt-4o-mini`                            | OpenAI model name                                    |
 | `ANTHROPIC_API_KEY` | (empty)                                  | Required when `LLM_BACKEND=claude`                   |
 | `CLAUDE_MODEL`      | `claude-opus-4-6`                        | Claude model name                                    |
-| `EMBEDDING_MODEL`   | `sentence-transformers/all-MiniLM-L6-v2` | Sentence-transformers model for embedding            |
+| `EMBEDDING_MODEL`   | `nomic-ai/nomic-embed-text-v1.5`         | Sentence-transformers model for embedding (768-dim)  |
+
+**Performance tuning**
+
+Scale these to the machine you are running on; the defaults are conservative so the stack starts anywhere.
+
+| Variable                | Default | Description                                                                                                                             |
+| ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `OLLAMA_NUM_CTX`        | `8192`  | Context window requested from Ollama. The entire RAG prompt must fit or Ollama truncates it from the start, dropping the system prompt.  |
+| `EMBEDDING_BATCH_SIZE`  | `64`    | Chunks embedded per batch in the embedding worker. Larger batches raise throughput at the cost of memory.                                |
+| `POSTGRES_SHARED_BUFFERS` | `2GB` | PostgreSQL page cache. Worth raising only once the corpus outgrows it.                                                                   |
+| `POSTGRES_WORK_MEM`     | `256MB` | Per-operation sort/hash memory for PostgreSQL.                                                                                          |
+| `QUERY_API_CPUS`        | `4.0`   | CPU limit for the Query API container. Retrieval runs in a thread pool, so this caps concurrent query throughput.                        |
+| `EMBEDDING_WORKER_CPUS` | `12.0`  | CPU limit for the embedding worker container.                                                                                           |
 
 **Security & API**
 
@@ -389,7 +404,12 @@ All configuration is driven by environment variables. See `.env.example` for the
 
 The Query API supports 3 LLM backends, selectable via the `LLM_BACKEND` environment variable:
 
-**Ollama (default)** -- Runs locally inside the Docker Compose stack. No API key required. The model is pulled automatically on first start. Start with `make run` (or `docker compose --profile local-llm up`). Suitable for development and self-hosted deployments. Requires ~6 GB RAM for the `mistral:7b` model weights (~8 GB total including Docker overhead).
+**Ollama (default)** -- Runs locally, with no API key required; the model named by `OLLAMA_MODEL` is pulled automatically on first start. Suitable for development and self-hosted deployments. There are two ways to run it:
+
+- *Containerised* (`make run`, or `docker compose --profile local-llm up`) — zero setup, fully portable. On macOS and Windows this runs inference **on CPU only**: Docker's Linux VM has no access to the host GPU, so generation is slow regardless of how much CPU or memory you give the container.
+- *Host-native* — run `ollama serve` on the host so it uses the host GPU (Metal on macOS, CUDA/ROCm on Linux), then start the stack **without** the `local-llm` profile (`make run-remote`) and set `OLLAMA_URL=http://host.docker.internal:11434`. This is typically an order of magnitude faster than the containerised path. Some runtimes (OrbStack) forward `host.docker.internal` to the host loopback, so a server bound to `127.0.0.1` is reachable as-is; on Docker Desktop the native server must listen on all interfaces instead (`OLLAMA_HOST=0.0.0.0:11434`), which does expose it to your local network.
+
+Size `OLLAMA_NUM_CTX` to your model and machine — the whole RAG prompt must fit inside it, or Ollama silently truncates the prompt from the start, discarding the system instructions first.
 
 **OpenAI** -- Calls the OpenAI chat completions API. Set `LLM_BACKEND=openai` and provide a valid `OPENAI_API_KEY`. Uses `gpt-4o-mini` by default. Start with `make run-remote`. Useful for higher-quality answers and evaluation comparisons.
 

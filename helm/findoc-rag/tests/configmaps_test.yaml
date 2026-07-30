@@ -100,6 +100,24 @@ tests:
           path: data.OLLAMA_MODEL
           value: mistral:7b
 
+  # Without an explicit num_ctx, Ollama falls back to its own small default
+  # and silently truncates the RAG prompt, dropping the system instructions.
+  - it: app-config configmap sets an explicit OLLAMA_NUM_CTX
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: data.OLLAMA_NUM_CTX
+          value: "8192"
+
+  - it: OLLAMA_NUM_CTX is overridable from values
+    documentIndex: 0
+    set:
+      queryApi.ollamaNumCtx: 32768
+    asserts:
+      - equal:
+          path: data.OLLAMA_NUM_CTX
+          value: "32768"
+
   # ── db-migrations configmap (documentIndex 1) ─────────────────────
 
   - it: db-migrations configmap has correct kind

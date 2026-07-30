@@ -8,6 +8,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING
 
@@ -33,7 +34,14 @@ logger = structlog.get_logger()
 
 
 class RAGGenerator:
-    """Orchestrates the full RAG pipeline: retrieve → facts → prompt → generate."""
+    """Orchestrates the full RAG pipeline: retrieve → facts → prompt → generate.
+
+    Retrieval and fact lookup are synchronous, CPU- and IO-bound work (a
+    sentence-transformers forward pass plus psycopg2 queries).  Calling them
+    directly from this coroutine would block the event loop for the whole
+    duration, serialising every concurrent request behind one query, so they
+    are dispatched to the default thread pool with ``asyncio.to_thread``.
+    """
 
     def __init__(
         self,
@@ -81,7 +89,8 @@ class RAGGenerator:
         #   embedding_ms  — query vector generation (returned by retriever)
         #   retrieval_ms  — pgvector SQL query (total minus embedding)
         t0_retrieve = time.perf_counter()
-        chunks, _, embedding_ms = self._retriever.retrieve(
+        chunks, _, embedding_ms = await asyncio.to_thread(
+            self._retriever.retrieve,
             question=question,
             top_k=top_k,
             ticker_filter=ticker_filter,
@@ -103,7 +112,9 @@ class RAGGenerator:
         # authoritative XBRL facts so figures come from structured data,
         # not prose retrieval.
         if self._facts is not None:
-            fact_chunks = self._facts.facts_for_question(question, ticker_filter)
+            fact_chunks = await asyncio.to_thread(
+                self._facts.facts_for_question, question, ticker_filter
+            )
             if fact_chunks:
                 chunks = fact_chunks + chunks
 

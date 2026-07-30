@@ -30,7 +30,9 @@ API Client  <-->  Query API  <-->  Ollama / OpenAI / Claude              |
 - Python 3.12 以降（ローカル開発および Docker 外でのテスト実行用）
 - GNU Make（任意、便利なターゲット用）
 
-**ハードウェア（Ollama / ローカル LLM パスの場合のみ）：** `make run` は `mistral:7b`（約 4 GB のダウンロード）を取得し、実行時に少なくとも **8 GB の空き RAM** が必要です（モデルの重み + Docker オーバーヘッド）。RAM が不足しているマシンでは Ollama コンテナが OOM で強制終了されます。リモート LLM パス（`LLM_BACKEND=claude` または `openai` を指定した `make run-remote`）では、ベーススタック（約 2 GB）以外に GPU や RAM の要件はありません。
+**ハードウェア：** 本スタックは実行するマシンに合わせてサイズを調整できます。コンテナの CPU およびメモリ上限、埋め込みのバッチサイズ、Ollama のコンテキストウィンドウはすべて環境変数です（[設定](#設定)を参照）。手持ちのハードウェアに合わせてスケールしてください。必要なリソースは、選択する LLM バックエンドにほぼ完全に依存します。`LLM_BACKEND=claude` または `openai` を指定した `make run-remote` はローカル推論を一切行いません。一方、ローカル LLM パスは選択したモデルによって決まります。
+
+ローカルでベンチマークを取る前に知っておくべき注意点が 1 つあります。**macOS および Windows では、コンテナ化された Ollama は CPU のみで動作します**。Docker の Linux VM はホストの GPU にアクセスできないためです。ローカル生成を大幅に高速化するには、ホスト上で Ollama をネイティブに実行し、`OLLAMA_URL` をそこに向けてください。[LLM バックエンド](#llm-バックエンド)を参照してください。
 
 ## クイックスタート
 
@@ -64,7 +66,7 @@ make run-remote
 
 初回起動時は、コンテナイメージのプル、3 つのサービスのビルド、データベースマイグレーションの実行が行われます。スキーマは `db/migrations/001_initial_schema.sql` から自動的に適用されます（`pgvector` 拡張、`ingestion_log` テーブル、`document_chunks` テーブル、HNSW ベクターインデックスを作成します）。マイグレーションを手動で実行するには：`make migrate`
 
-Ollama を使用する場合（`make run`）、`mistral:7b` モデル（約 4 GB）は初回起動時に自動的にダウンロードされます。2 回目以降の起動ではキャッシュされたレイヤーとボリュームが再利用されます。
+Ollama を使用する場合（`make run`）、`OLLAMA_MODEL` で指定したモデルが初回起動時に自動的にダウンロードされます。2 回目以降の起動ではキャッシュされたレイヤーとボリュームが再利用されます。
 
 4. サービスが起動していることを確認します。
 
@@ -350,7 +352,20 @@ make helm-teardown
 | `OPENAI_MODEL`      | `gpt-4o-mini`                            | OpenAI モデル名                                       |
 | `ANTHROPIC_API_KEY` | （空）                                   | `LLM_BACKEND=claude` 時に必須                         |
 | `CLAUDE_MODEL`      | `claude-opus-4-6`                        | Claude モデル名                                       |
-| `EMBEDDING_MODEL`   | `sentence-transformers/all-MiniLM-L6-v2` | 埋め込み用 sentence-transformers モデル               |
+| `EMBEDDING_MODEL`   | `nomic-ai/nomic-embed-text-v1.5`         | 埋め込み用 sentence-transformers モデル（768 次元）   |
+
+**パフォーマンスチューニング**
+
+実行するマシンに合わせてスケールしてください。デフォルト値はどの環境でも起動できるよう控えめに設定されています。
+
+| 変数                      | デフォルト | 説明                                                                                                             |
+| ------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| `OLLAMA_NUM_CTX`          | `8192`     | Ollama に要求するコンテキストウィンドウ。RAG プロンプト全体が収まらない場合、先頭から切り捨てられシステムプロンプトが失われます。 |
+| `EMBEDDING_BATCH_SIZE`    | `64`       | 埋め込みワーカーが 1 バッチで処理するチャンク数。大きくするとスループットが向上しますが、メモリを消費します。       |
+| `POSTGRES_SHARED_BUFFERS` | `2GB`      | PostgreSQL のページキャッシュ。コーパスがこれを超えてから引き上げる価値があります。                                |
+| `POSTGRES_WORK_MEM`       | `256MB`    | PostgreSQL の操作あたりのソート / ハッシュ用メモリ。                                                              |
+| `QUERY_API_CPUS`          | `4.0`      | Query API コンテナの CPU 上限。検索はスレッドプールで実行されるため、同時クエリのスループットを制限します。         |
+| `EMBEDDING_WORKER_CPUS`   | `12.0`     | 埋め込みワーカーコンテナの CPU 上限。                                                                            |
 
 **セキュリティと API**
 
@@ -389,7 +404,12 @@ make helm-teardown
 
 Query API は `LLM_BACKEND` 環境変数で選択可能な 3 つの LLM バックエンドをサポートします。
 
-**Ollama（デフォルト）** -- Docker Compose スタック内でローカルに実行されます。API キー不要。モデルは初回起動時に自動的に取得されます。`make run`（または `docker compose --profile local-llm up`）で起動します。開発環境およびセルフホスト型デプロイに適しています。`mistral:7b` のモデルウェイトには約 6 GB の RAM が必要です（Docker オーバーヘッドを含む合計では約 8 GB）。
+**Ollama（デフォルト）** -- ローカルで実行され、API キーは不要です。`OLLAMA_MODEL` で指定したモデルは初回起動時に自動的に取得されます。開発環境およびセルフホスト型デプロイに適しています。実行方法は 2 通りあります。
+
+- *コンテナ化*（`make run`、または `docker compose --profile local-llm up`）— セットアップ不要で完全にポータブルです。ただし macOS および Windows では推論が **CPU のみ** で実行されます。Docker の Linux VM はホストの GPU にアクセスできないため、コンテナに CPU やメモリをどれだけ割り当てても生成は低速です。
+- *ホストネイティブ* — ホスト上で `ollama serve` を実行してホストの GPU（macOS では Metal、Linux では CUDA / ROCm）を利用し、`local-llm` プロファイル **なし** でスタックを起動して（`make run-remote`）、`OLLAMA_URL=http://host.docker.internal:11434` を設定します。この方法は通常、コンテナ化パスより一桁高速です。一部のランタイム（OrbStack）は `host.docker.internal` をホストのループバックに転送するため、`127.0.0.1` にバインドされたサーバーにそのまま到達できます。Docker Desktop の場合はネイティブサーバーをすべてのインターフェースで待ち受けさせる必要があります（`OLLAMA_HOST=0.0.0.0:11434`）。これはローカルネットワークに公開されることを意味します。
+
+`OLLAMA_NUM_CTX` はモデルとマシンに合わせて設定してください。RAG プロンプト全体がその中に収まらない場合、Ollama はプロンプトを先頭から静かに切り捨て、最初にシステム指示が失われます。
 
 **OpenAI** -- OpenAI のチャット補完 API を呼び出します。`LLM_BACKEND=openai` を設定し、有効な `OPENAI_API_KEY` を提供します。デフォルトでは `gpt-4o-mini` を使用します。`make run-remote` で起動します。より高品質な回答や評価比較に有用です。
 

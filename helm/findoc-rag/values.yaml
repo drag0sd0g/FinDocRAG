@@ -96,6 +96,9 @@ queryApi:
   port: 8000
   llmBackend: ollama
   ollamaModel: mistral:7b
+  # Context window requested from Ollama. The full RAG prompt must fit or
+  # Ollama truncates it silently, dropping the system prompt first.
+  ollamaNumCtx: 8192
   embeddingModel: "nomic-ai/nomic-embed-text-v1.5"
   apiKeys: "dev-key-1,dev-key-2"
   openaiApiKey: ""

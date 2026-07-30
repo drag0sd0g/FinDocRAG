@@ -115,9 +115,19 @@ def main() -> None:
             corpus_mean = row[0] if row else None
 
         with conn.cursor() as cur:
+            # NOW() is already an absolute timestamptz, so it is compared
+            # directly against created_at (also timestamptz).  Stripping the
+            # zone with AT TIME ZONE 'UTC' would yield a naive timestamp that
+            # Postgres re-interprets in the server's local zone, sliding the
+            # lookback window by that offset on any non-UTC server.
+            #
+            # make_interval() takes the window as a real parameter.  The
+            # interval cannot be written as INTERVAL '%s days': the
+            # placeholder would sit inside a string literal, which psycopg2
+            # documents as unsupported.
             cur.execute(
                 "SELECT avg(embedding) FROM document_chunks "
-                "WHERE created_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '%s days'",
+                "WHERE created_at >= NOW() - make_interval(days => %s)",
                 (DRIFT_LOOKBACK_DAYS,),
             )
             row = cur.fetchone()

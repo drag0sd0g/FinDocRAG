@@ -5,7 +5,10 @@ All external dependencies (retriever, LLM, DB) are mocked.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -126,6 +129,121 @@ class TestRAGGenerator:
         assert result.answer is None
         assert result.sources == []
         mock_llm.generate.assert_not_called()
+
+
+# ── Event loop must stay free during retrieval ───────────────────
+
+class TestEventLoopIsNotBlocked:
+    """Retrieval is synchronous CPU + IO work (a sentence-transformers forward
+    pass and psycopg2 queries).  Awaiting it inline would pin the event loop
+    for the whole query, so a single-worker uvicorn would serve exactly one
+    request at a time regardless of how many arrive.
+    """
+
+    @staticmethod
+    def _retriever_recording_thread(record: dict[str, int]) -> MagicMock:
+        def _retrieve(**_kwargs: object) -> tuple:
+            record["retrieve"] = threading.get_ident()
+            return ([], [0.1] * 768, 1.0)
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.side_effect = _retrieve
+        return mock_retriever
+
+    @pytest.mark.asyncio
+    async def test_retrieval_runs_off_the_event_loop_thread(self) -> None:
+        record: dict[str, int] = {}
+        mock_llm = AsyncMock()
+        mock_llm.model_name = "test-model"
+
+        gen = RAGGenerator(
+            retriever=self._retriever_recording_thread(record), llm=mock_llm
+        )
+        await gen.answer("What are Apple's risks?")
+
+        assert record["retrieve"] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_fact_lookup_runs_off_the_event_loop_thread(self) -> None:
+        """The XBRL lookup is another blocking psycopg2 round trip."""
+        record: dict[str, int] = {}
+
+        def _facts_for_question(*_args: object) -> list:
+            record["facts"] = threading.get_ident()
+            return []
+
+        mock_facts = MagicMock()
+        mock_facts.facts_for_question.side_effect = _facts_for_question
+
+        mock_llm = AsyncMock()
+        mock_llm.model_name = "test-model"
+
+        gen = RAGGenerator(
+            retriever=self._retriever_recording_thread({}),
+            llm=mock_llm,
+            facts=mock_facts,
+        )
+        await gen.answer("What was revenue in 2024?", ticker_filter="AAPL")
+
+        assert record["facts"] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_queries_overlap(self) -> None:
+        """Three slow retrievals must run concurrently, not back to back."""
+        retrieve_seconds = 0.2
+        concurrency = 3
+
+        def _slow_retrieve(**_kwargs: object) -> tuple:
+            time.sleep(retrieve_seconds)  # blocking on purpose
+            return ([], [0.1] * 768, 1.0)
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.side_effect = _slow_retrieve
+        mock_llm = AsyncMock()
+        mock_llm.model_name = "test-model"
+
+        gen = RAGGenerator(retriever=mock_retriever, llm=mock_llm)
+
+        started = time.perf_counter()
+        await asyncio.gather(*(gen.answer("question") for _ in range(concurrency)))
+        elapsed = time.perf_counter() - started
+
+        serial = retrieve_seconds * concurrency
+        # Generous margin: the point is "clearly not serial", not a precise time.
+        assert elapsed < serial * 0.7, (
+            f"{concurrency} queries took {elapsed:.2f}s; "
+            f"serial execution would be ~{serial:.2f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_coroutines_progress_during_retrieval(self) -> None:
+        """A blocked loop would starve every unrelated task on it."""
+        ticks = 0
+
+        async def _ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        def _slow_retrieve(**_kwargs: object) -> tuple:
+            time.sleep(0.2)
+            return ([], [0.1] * 768, 1.0)
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.side_effect = _slow_retrieve
+        mock_llm = AsyncMock()
+        mock_llm.model_name = "test-model"
+
+        gen = RAGGenerator(retriever=mock_retriever, llm=mock_llm)
+
+        background = asyncio.create_task(_ticker())
+        try:
+            await gen.answer("question")
+        finally:
+            background.cancel()
+
+        assert ticks > 0, "event loop made no progress while retrieval ran"
 
 
 # ── Auth ─────────────────────────────────────────────────────────

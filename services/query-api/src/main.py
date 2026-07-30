@@ -14,6 +14,7 @@ References:
   - TDD: Section 9.3 (rate limiting)
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -34,7 +35,7 @@ from slowapi.util import get_remote_address
 
 from src.auth import verify_api_key
 from src.llm.anthropic_backend import AnthropicBackend
-from src.llm.ollama_backend import OllamaBackend
+from src.llm.ollama_backend import DEFAULT_NUM_CTX, OllamaBackend
 from src.llm.openai_backend import OpenAIBackend
 from src.metrics import DEGRADED_RESPONSES_TOTAL, REQUESTS_TOTAL
 from src.models import (
@@ -59,6 +60,9 @@ POSTGRES_DSN = (
 LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+# Context window requested from Ollama. Must be large enough to hold the whole
+# RAG prompt or Ollama truncates it silently (see src/llm/ollama_backend.py).
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", str(DEFAULT_NUM_CTX)))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
@@ -146,7 +150,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     elif LLM_BACKEND == "claude":
         llm = AnthropicBackend(model=CLAUDE_MODEL)  # type: ignore[assignment]
     else:
-        llm = OllamaBackend(base_url=OLLAMA_URL, model=OLLAMA_MODEL)  # type: ignore[assignment]
+        llm = OllamaBackend(  # type: ignore[assignment]
+            base_url=OLLAMA_URL, model=OLLAMA_MODEL, num_ctx=OLLAMA_NUM_CTX
+        )
 
     _generator = RAGGenerator(retriever=_retriever, llm=llm, facts=_facts_repo)
 
@@ -212,13 +218,16 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> Respo
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """Liveness probe (FR-21) — healthy when DB is reachable."""
+    """Liveness probe (FR-21) — healthy when DB is reachable.
+
+    The probe query is synchronous psycopg2, so it runs in a worker thread:
+    a slow or hung database must not stall the event loop for every other
+    in-flight request.
+    """
     if _retriever is None:
         raise HTTPException(status_code=503, detail="unhealthy: not initialized")
     try:
-        cur = _retriever._get_conn().cursor()
-        cur.execute("SELECT 1")
-        cur.close()
+        await asyncio.to_thread(_retriever.ping)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="unhealthy: db_unreachable") from exc
     return {"status": "healthy"}
@@ -294,7 +303,9 @@ async def list_documents(
 
     REQUESTS_TOTAL.labels(endpoint="/v1/documents", status="success").inc()
 
-    rows, total = _retriever.list_documents(ticker=ticker, limit=limit, offset=offset)
+    rows, total = await asyncio.to_thread(
+        _retriever.list_documents, ticker=ticker, limit=limit, offset=offset
+    )
 
     documents = [
         DocumentInfo(

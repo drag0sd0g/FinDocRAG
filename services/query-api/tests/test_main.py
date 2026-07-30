@@ -98,7 +98,7 @@ class TestHealthEndpoints:
         import src.main as main_mod
 
         mock_retriever = MagicMock()
-        mock_retriever._get_conn.side_effect = Exception("db unreachable")
+        mock_retriever.ping.side_effect = Exception("db unreachable")
 
         original_retriever = main_mod._retriever
         original_generator = main_mod._generator
@@ -109,6 +109,36 @@ class TestHealthEndpoints:
             client = TestClient(app=main_mod.app, raise_server_exceptions=False)
             response = client.get("/health")
             assert response.status_code == 503
+        finally:
+            main_mod._retriever = original_retriever
+            main_mod._generator = original_generator
+
+    def test_health_probe_runs_off_the_event_loop_thread(self) -> None:
+        """A hung database must not stall the loop for every in-flight request."""
+        import threading
+
+        from fastapi.testclient import TestClient
+
+        import src.main as main_mod
+
+        probe_thread: dict[str, int] = {}
+        mock_retriever = MagicMock()
+        mock_retriever.ping.side_effect = lambda: probe_thread.setdefault(
+            "id", threading.get_ident()
+        )
+
+        original_retriever = main_mod._retriever
+        original_generator = main_mod._generator
+        main_mod._retriever = mock_retriever
+        main_mod._generator = MagicMock()
+
+        try:
+            client = TestClient(app=main_mod.app, raise_server_exceptions=False)
+            response = client.get("/health")
+            assert response.status_code == 200
+            # TestClient drives the loop from its own thread; the probe must
+            # not have run on whichever thread the handler coroutine used.
+            assert probe_thread["id"] != threading.get_ident()
         finally:
             main_mod._retriever = original_retriever
             main_mod._generator = original_generator
